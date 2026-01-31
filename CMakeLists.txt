@@ -7,4 +7,8 @@ add_executable(KV_STORE src/main.cpp
         src/kv_store.cpp
         include/kv_store.h
         src/parser.cpp
-        include/parser.h)
+        include/parser.h
+        src/server.cpp
+        network/server.h
+        src/client.cpp
+        network/client.h)
