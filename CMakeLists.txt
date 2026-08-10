@@ -25,6 +25,8 @@ target_link_libraries(kv_core PRIVATE Threads::Threads)
 
 add_executable(kv_server
         src/server.cpp
+        src/wal.cpp
+        include/wal.h
 )
 
 target_link_libraries(kv_server PRIVATE kv_core)
@@ -47,7 +49,30 @@ target_include_directories(kv_client PRIVATE
         /opt/homebrew/opt/asio/include
 )
 
+add_executable(kv_bench_engine
+        bench/bench_engine.cpp
+)
 
+target_link_libraries(kv_bench_engine PRIVATE kv_core)
 
+target_include_directories(kv_bench_engine PRIVATE
+        include
+        /opt/homebrew/opt/asio/include
+)
+
+add_executable(kv_bench_network
+        bench/bench_network.cpp
+)
+
+find_package(Threads REQUIRED)
+target_link_libraries(kv_bench_network PRIVATE Threads::Threads)
+
+target_include_directories(kv_bench_network PRIVATE
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_bench_network PRIVATE
+        ASIO_STANDALONE
+)
 
 
