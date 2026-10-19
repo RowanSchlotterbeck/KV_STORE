@@ -82,11 +82,38 @@ static void test_other_commands_unchanged() {
     CHECK(process_line(R"(PUT "a" "b" "")") == "INPUT_ERROR");
 }
 
+static void test_non_ascii_bytes() {
+    std::puts("test_non_ascii_bytes");
+    // UTF-8 "é" (0xC3 0xA9) in key and value.
+    CHECK(input_parser("PUT \"caf\xC3\xA9\" \"\xC3\xA9t\xC3\xA9\"")
+          == (args_t{"PUT", "caf\xC3\xA9", "\xC3\xA9t\xC3\xA9"}));
+    CHECK(process_line("PUT \"caf\xC3\xA9\" \"\xC3\xA9t\xC3\xA9\"") == "OK");
+    CHECK(process_line("GET \"caf\xC3\xA9\"") == "\xC3\xA9t\xC3\xA9");
+    CHECK(process_line("DEL \"caf\xC3\xA9\"") == "OK");
+
+    // Every byte 0x80-0xFF, alone as a value, survives intact and is never
+    // treated as whitespace (0xA0 and 0x85 are spaces in some locales).
+    for (int b = 0x80; b <= 0xFF; ++b) {
+        const std::string byte(1, static_cast<char>(b));
+        CHECK(input_parser("PUT \"hi\" \"" + byte + "\"") == (args_t{"PUT", "hi", byte}));
+        CHECK(process_line("PUT \"hi\" \"" + byte + "\"") == "OK");
+        CHECK(process_line("GET \"hi\"") == byte);
+        // Unquoted, a high byte still doesn't split tokens.
+        CHECK(input_parser("x" + byte + "y") == (args_t{"X" + byte + "Y"}));
+    }
+    CHECK(process_line("DEL \"hi\"") == "OK");
+
+    // High bytes outside quotes: unchanged error handling.
+    CHECK(process_line("\xC3\xA9") == "ERR_UNKNOWN_CMD");
+    CHECK(process_line("GET \x80") == "INPUT_ERROR"); // unquoted key: quote count != 2
+}
+
 int main() {
     test_put_empty_value();
     test_put_too_few_args();
     test_put_with_value_unchanged();
     test_other_commands_unchanged();
+    test_non_ascii_bytes();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

@@ -30,7 +30,7 @@ std::vector<std::string> input_parser(const std::string& line)
             in_quotes = !in_quotes;
             token_quoted = true;
             quote_counter++;
-        } else if (std::isspace(c) && !in_quotes) {
+        } else if (std::isspace(static_cast<unsigned char>(c)) && !in_quotes) {
             if (!current.empty() || token_quoted) {
                 args.push_back(current);
             }
