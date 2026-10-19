@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package kvstore;
+
+// Wire format for a single state-machine command.
+// `value` uses proto3 `optional` so field presence is tracked: an absent
+// value (DEL) is distinguishable from a present-but-empty one (PUT key "").
+message Command {
+  string operation = 1;
+  string key = 2;
+  optional string value = 3;
+}
+
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  Command command = 3;
+}
