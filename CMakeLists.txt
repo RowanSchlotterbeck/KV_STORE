@@ -111,3 +111,16 @@ target_include_directories(kv_serialization_test PRIVATE
 )
 
 add_test(NAME serialization COMMAND kv_serialization_test)
+
+add_executable(kv_parser_test
+        tests/parser_test.cpp
+)
+
+target_link_libraries(kv_parser_test PRIVATE kv_core)
+
+target_include_directories(kv_parser_test PRIVATE
+        include
+        /opt/homebrew/opt/asio/include
+)
+
+add_test(NAME parser COMMAND kv_parser_test)

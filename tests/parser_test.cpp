@@ -1,0 +1,97 @@
+// Parser and line-protocol tests. Covers the empty-value PUT fix and the
+// former out-of-bounds read on short PUTs, plus unchanged behavior elsewhere.
+// Standalone (no framework): exits non-zero if any check fails.
+
+#include <cstdio>
+#include <string>
+#include <vector>
+#include "../include/parser.h"
+#include "../include/engine.h"
+
+static int failures = 0;
+
+#define CHECK(cond)                                                          \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            std::fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            ++failures;                                                      \
+        }                                                                    \
+    } while (0)
+
+using args_t = std::vector<std::string>;
+static const args_t kParseError = {"Error"};
+
+// process_line shares one StateMachine across the process, so tests use
+// distinct keys and run in a fixed order.
+
+static void test_put_empty_value() {
+    std::puts("test_put_empty_value");
+    CHECK(input_parser(R"(PUT "a" "")") == (args_t{"PUT", "a", ""}));
+    CHECK(process_line(R"(PUT "a" "")") == "OK");
+    CHECK(process_line(R"(GET "a")") == "");          // present but empty, not NOT_FOUND
+    CHECK(process_line(R"(DEL "a")") == "OK");
+    CHECK(process_line(R"(GET "a")") == "NOT_FOUND");
+}
+
+static void test_put_too_few_args() {
+    std::puts("test_put_too_few_args");
+    // Unbalanced quote count: rejected before any indexing (unchanged).
+    CHECK(input_parser(R"(PUT "a")") == kParseError);
+    CHECK(process_line(R"(PUT "a")") == "INPUT_ERROR");
+    CHECK(input_parser("PUT") == kParseError);
+    CHECK(process_line("PUT") == "INPUT_ERROR");
+
+    // Four quotes but fewer than three tokens: formerly read past the end
+    // of args; now reaches process_line's arity check.
+    CHECK(process_line(R"(PUT "" "v")") == "ERR_USAGE PUT <key> <value>");
+    CHECK(process_line(R"(PUT "" "")") == "ERR_USAGE PUT <key> <value>");
+    CHECK(process_line(R"(PUT "a""b")") == "ERR_USAGE PUT <key> <value>");
+    CHECK(process_line(R"(PUT "a""")") == "ERR_USAGE PUT <key> <value>");
+}
+
+static void test_put_with_value_unchanged() {
+    std::puts("test_put_with_value_unchanged");
+    CHECK(input_parser(R"(PUT "b" "hello")") == (args_t{"PUT", "b", "hello"}));
+    CHECK(process_line(R"(PUT "b" "hello")") == "OK");
+    CHECK(process_line(R"(GET "b")") == "hello");
+    CHECK(input_parser(R"(PUT "k" "v w")") == (args_t{"PUT", "k", "v w"}));
+}
+
+static void test_other_commands_unchanged() {
+    std::puts("test_other_commands_unchanged");
+    CHECK(input_parser(R"(GET "b")") == (args_t{"GET", "b"}));
+    CHECK(input_parser(R"(DEL "b")") == (args_t{"DEL", "b"}));
+    CHECK(input_parser("LIST") == (args_t{"LIST"}));
+    CHECK(process_line(R"(DEL "b")") == "OK");
+    CHECK(process_line(R"(DEL "b")") == "NOT_FOUND");
+    CHECK(process_line(R"(GET "missing")") == "NOT_FOUND");
+    CHECK(process_line("LIST") == "(empty)");
+    CHECK(process_line("EXIT") == "EXIT");
+
+    // Garbage / malformed input.
+    CHECK(process_line("") == "INPUT_ERROR");
+    CHECK(process_line("   ") == "INPUT_ERROR");
+    CHECK(process_line("garbage") == "ERR_UNKNOWN_CMD");
+    CHECK(process_line("GET a") == "INPUT_ERROR");
+    CHECK(process_line(R"(GET "a" "b")") == "INPUT_ERROR");
+
+    // Empty quoted strings outside the PUT value slot are still dropped.
+    CHECK(process_line(R"("")") == "INPUT_ERROR");
+    CHECK(process_line(R"(GET "")") == "ERR_USAGE GET <key>");
+    CHECK(process_line(R"(DEL "")") == "ERR_USAGE DEL <key>");
+    CHECK(process_line(R"(PUT "a" "b" "")") == "INPUT_ERROR");
+}
+
+int main() {
+    test_put_empty_value();
+    test_put_too_few_args();
+    test_put_with_value_unchanged();
+    test_other_commands_unchanged();
+
+    if (failures) {
+        std::fprintf(stderr, "%d check(s) failed\n", failures);
+        return 1;
+    }
+    std::puts("all parser tests passed");
+    return 0;
+}
