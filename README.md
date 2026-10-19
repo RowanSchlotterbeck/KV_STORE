@@ -19,8 +19,9 @@ bench/          Benchmark programs
   command shape (see Protocol below).
 - `engine.{h,cpp}` — `process_line()`: parses + executes a single line
   against the process-wide store; this is what the server calls per request.
-- `wal.{h,cpp}` — write-ahead log (in progress, not yet wired into the
-  server).
+- `wal.{h,cpp}` — `PersistentLog`: append-only, fsync-per-write command
+  log. Writes are logged before they are applied; the server replays it on
+  startup (`kv_server [log_path]`, default `data/kvstore.log`).
 - `src/server.cpp` / `src/client.cpp` — Asio TCP server and a simple
   interactive client, both built on `kv_core`.
 
@@ -135,8 +136,8 @@ round trip, not the engine, is the bottleneck for real client traffic.
 
 ## Known limitations
 
-- Single global store, no persistence: state is lost on restart (the WAL
-  in `include/wal.h` / `src/wal.cpp` is a stub and not yet integrated).
+- Single node only. Every write is fsynced individually (no batching), so
+  write throughput is bounded by disk sync latency.
 - No authentication, TLS, or multi-database support.
 - The server handles one line per read/write cycle per connection with
   no pipelining.

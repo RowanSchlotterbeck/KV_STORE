@@ -4,6 +4,8 @@
 // Measures the full command path (parse + validate + execute) via
 // process_line(), and the raw map-operation path via execute(), so
 // parser overhead can be seen separately from unordered_map overhead.
+// process_line PUT includes a durable (fsynced) log append per write, using a
+// throwaway log in a temp directory.
 //
 // Usage: kv_bench_engine [num_ops]
 
@@ -11,9 +13,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
 
 #include "engine.h"
 #include "kv_store.h"
@@ -91,6 +95,13 @@ int main(int argc, char** argv) {
 
     std::printf("KV_STORE engine benchmark (%ld ops per case)\n\n", n);
 
+    std::string tmp = (std::filesystem::temp_directory_path() / "kv_bench_engine.XXXXXX").string();
+    if (!::mkdtemp(tmp.data())) {
+        std::perror("mkdtemp");
+        return 1;
+    }
+    init_engine((std::filesystem::path(tmp) / "kvstore.log").string());
+
     // --- Full protocol path (process_line: parse + validate + execute) ---
     std::vector<std::string> put_lines;
     std::vector<std::string> get_lines;
@@ -124,5 +135,6 @@ int main(int argc, char** argv) {
     print_result(bench_execute("execute GET (miss)", n, map, {{"GET", "nonexistent"}}));
     print_result(bench_execute("execute DEL", n, map, put_args));
 
+    std::filesystem::remove_all(tmp);
     return 0;
 }

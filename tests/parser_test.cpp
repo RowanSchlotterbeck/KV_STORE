@@ -3,8 +3,10 @@
 // Standalone (no framework): exits non-zero if any check fails.
 
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
+#include <unistd.h>
 #include "../include/parser.h"
 #include "../include/engine.h"
 
@@ -109,11 +111,21 @@ static void test_non_ascii_bytes() {
 }
 
 int main() {
+    // Writes go through the persistent log; keep it in a temp dir.
+    std::string tmp = (std::filesystem::temp_directory_path() / "kv_parser_test.XXXXXX").string();
+    if (!::mkdtemp(tmp.data())) {
+        std::perror("mkdtemp");
+        return 2;
+    }
+    init_engine((std::filesystem::path(tmp) / "kvstore.log").string());
+
     test_put_empty_value();
     test_put_too_few_args();
     test_put_with_value_unchanged();
     test_other_commands_unchanged();
     test_non_ascii_bytes();
+
+    std::filesystem::remove_all(tmp);
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

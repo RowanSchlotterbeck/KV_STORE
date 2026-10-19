@@ -3,6 +3,7 @@
 //
 
 #include <server.h>
+#include "../include/wal.h"
 
 
 using asio::ip::tcp;
@@ -70,7 +71,21 @@ private:
     tcp::acceptor acceptor_;
 };
 
-int main() {
+int main(int argc, char** argv) {
+    const std::string log_path = argc > 1 ? argv[1] : PersistentLog::kDefaultPath;
+    try {
+        // Rebuild state from the log before accepting any connections.
+        const auto recovered = init_engine(log_path);
+        std::cout << "Replayed " << recovered.last_index << " log entries from " << log_path << "\n";
+        if (recovered.recovered_tail_bytes > 0) {
+            std::cout << "Discarded " << recovered.recovered_tail_bytes
+                      << " bytes of incomplete final entry (crash mid-write)\n";
+        }
+    } catch (const wal_error& e) {
+        std::cerr << "Failed to load log: " << e.what() << "\n";
+        return 1;
+    }
+
     asio::io_context io;
     Server server(io, 5555);
     std::cout << "KV server listening on port 5555\n";
