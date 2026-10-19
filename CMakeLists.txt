@@ -29,6 +29,7 @@ add_library(kv_core
         src/parser.cpp
         src/engine.cpp
         src/serialization.cpp
+        src/wal.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -47,8 +48,6 @@ target_link_libraries(kv_core PRIVATE Threads::Threads kv_proto)
 
 add_executable(kv_server
         src/server.cpp
-        src/wal.cpp
-        include/wal.h
 )
 
 target_link_libraries(kv_server PRIVATE kv_core)
@@ -124,3 +123,15 @@ target_include_directories(kv_parser_test PRIVATE
 )
 
 add_test(NAME parser COMMAND kv_parser_test)
+
+add_executable(kv_wal_test
+        tests/wal_test.cpp
+)
+
+target_link_libraries(kv_wal_test PRIVATE kv_core)
+
+target_include_directories(kv_wal_test PRIVATE
+        include
+)
+
+add_test(NAME wal COMMAND kv_wal_test)
