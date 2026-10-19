@@ -6,11 +6,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include "../include/crc32c.h"
 #include "../include/serialization.h"
 #include "../include/state_machine.h"
 #include "../include/wal.h"
@@ -126,109 +128,252 @@ static void test_append_requires_replay() {
     CHECK(throws_wal_error([&] { log.replay(sm); }));             // only once
 }
 
-// Writes N complete entries, then the first `cut` bytes of entry N+1, as a
-// crash mid-append would leave it. Covers every cut point, i.e. both inside
-// the 4-byte length prefix and inside the body.
-static void test_torn_tail_recovery() {
-    std::puts("test_torn_tail_recovery");
-    const std::vector<command> cmds = {put("a", "1"), put("b", ""), del("a"), put("c", "three")};
-    const std::uint64_t n = cmds.size();
-    const expected_t expected = {{"a", std::nullopt}, {"b", ""}, {"c", "three"}};
+static std::string read_file(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
 
-    const fs::path good = temp_log("torn_base");
+static void write_file(const fs::path& p, const std::string& bytes) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+// Replays `path` into a fresh state machine; returns the wal_error message,
+// or an empty string if replay succeeded.
+static std::string replay_error(const fs::path& path) {
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    try {
+        log.replay(sm);
+    } catch (const wal_error& e) {
+        return e.what();
+    }
+    return "";
+}
+
+static const std::vector<command> kCmds = {put("a", "1"), put("b", ""), del("a"), put("c", "three")};
+static const expected_t kExpected = {{"a", std::nullopt}, {"b", ""}, {"c", "three"}};
+
+struct good_log
+{
+    fs::path path;
+    std::uint64_t size;
+    std::vector<std::uint64_t> frame_offsets;  // start of each entry's frame
+};
+
+// Writes kCmds through PersistentLog, recording where each frame starts.
+static good_log write_good_log(const std::string& name) {
+    good_log g{temp_log(name), 0, {}};
+    fs::create_directories(g.path.parent_path());
+    PersistentLog log;
+    log.open(g.path.string());
+    StateMachine sm;
+    log.replay(sm);
+    for (const auto& c : kCmds) {
+        g.frame_offsets.push_back(size_on_disk(g.path));
+        log.append(c);
+    }
+    g.size = size_on_disk(g.path);
+    return g;
+}
+
+// Asserts that `path` (a copy of a good log plus `tail_bytes` of damaged tail)
+// recovers every complete entry, is truncated back to `good_size`, accepts a
+// new append, and that the new entry replays.
+static void check_tail_recovers(const fs::path& path, std::uint64_t good_size, std::uint64_t tail_bytes) {
+    const std::uint64_t n = kCmds.size();
     {
         PersistentLog log;
-        log.open(good.string());
+        log.open(path.string());
         StateMachine sm;
-        log.replay(sm);
-        for (const auto& c : cmds) { log.append(c); }
+        CHECK(log.replay(sm) == n);                         // all complete entries recovered
+        CHECK(log.recovered_tail_bytes() == tail_bytes);
+        CHECK(size_on_disk(path) == good_size);             // truncated to last good offset
+        CHECK(matches(sm, kExpected));
+        CHECK(log.append(put("after", "crash")) == n + 1);  // resumes on a clean boundary
     }
-    const std::uint64_t good_size = size_on_disk(good);
+    {
+        PersistentLog log;
+        log.open(path.string());
+        StateMachine sm;
+        CHECK(log.replay(sm) == n + 1);
+        CHECK(log.recovered_tail_bytes() == 0);
+        expected_t after = kExpected;
+        after["after"] = "crash";
+        after["torn"] = std::nullopt;
+        CHECK(matches(sm, after));
+    }
+}
 
-    std::string torn_frame;
-    CHECK(serialize_entry(log_entry{n + 1, 0, put("torn", "never committed")}, torn_frame));
-    CHECK(torn_frame.size() > kFrameHeaderSize + 1);
+static void test_crc32c_known_answers() {
+    std::puts("test_crc32c_known_answers");
+    std::string zeros(32, '\0'), ones(32, '\xFF'), inc(32, '\0'), dec(32, '\0');
+    for (int i = 0; i < 32; ++i) {
+        inc[i] = static_cast<char>(i);
+        dec[i] = static_cast<char>(31 - i);
+    }
+    // "123456789" check value, plus the RFC 3720 (iSCSI) appendix B.4 vectors.
+    const std::vector<std::pair<std::string, std::uint32_t>> vectors = {
+        {"", 0x00000000u},
+        {"123456789", 0xE3069283u},
+        {zeros, 0x8A9136AAu},
+        {ones, 0x62A8AB43u},
+        {inc, 0x46DD794Eu},
+        {dec, 0x113FDB5Cu},
+    };
+    for (const auto& [data, want] : vectors) {
+        CHECK(crc32c(data) == want);
+        CHECK(crc32c_software(data.data(), data.size()) == want);
+    }
+    // Accelerated and table paths agree on every length/alignment up to 64.
+    std::string bytes;
+    for (int i = 0; i < 100; ++i) { bytes.push_back(static_cast<char>(i * 37 + 11)); }
+    for (std::size_t start = 0; start < 8; ++start) {
+        for (std::size_t len = 0; len + start <= 72; ++len) {
+            CHECK(crc32c(bytes.data() + start, len) == crc32c_software(bytes.data() + start, len));
+        }
+    }
+    std::printf("  crc32c path: %s\n", crc32c_is_hardware() ? "hardware" : "software");
+}
+
+static void test_frame_layout() {
+    std::puts("test_frame_layout");
+    const log_entry e{7, 0, put("k", "v")};
+    const std::string frame = PersistentLog::encode_frame(e);
+    std::string payload;
+    CHECK(encode_entry_payload(e, payload));
+    CHECK(frame.size() == PersistentLog::kHeaderSize + payload.size());
+    const auto u32_at = [&](std::size_t i) {
+        std::uint32_t v = 0;
+        for (int b = 3; b >= 0; --b) { v = (v << 8) | static_cast<unsigned char>(frame[i + b]); }
+        return v;
+    };
+    CHECK(u32_at(0) == payload.size());
+    CHECK(u32_at(4) == crc32c(payload));
+    CHECK(frame.substr(PersistentLog::kHeaderSize) == payload);
+}
+
+// Writes N complete entries, then the first `cut` bytes of entry N+1, as a
+// crash mid-append would leave it. Covers every cut point, i.e. inside the
+// 8-byte [length][crc] header and inside the body.
+static void test_torn_tail_recovery() {
+    std::puts("test_torn_tail_recovery");
+    const good_log good = write_good_log("torn_base");
+    const std::string torn_frame =
+        PersistentLog::encode_frame(log_entry{kCmds.size() + 1, 0, put("torn", "never committed")});
+    CHECK(torn_frame.size() > PersistentLog::kHeaderSize + 1);
 
     int cases = 0;
     for (std::size_t cut = 1; cut < torn_frame.size(); ++cut) {
         const fs::path path = temp_log("torn_" + std::to_string(cut));
         fs::create_directories(path.parent_path());
-        fs::copy_file(good, path);
+        fs::copy_file(good.path, path);
         append_raw(path, torn_frame.substr(0, cut));
-        CHECK(size_on_disk(path) == good_size + cut);
-
-        {
-            PersistentLog log;
-            log.open(path.string());
-            StateMachine sm;
-            CHECK(log.replay(sm) == n);                       // all complete entries recovered
-            CHECK(log.recovered_tail_bytes() == cut);
-            CHECK(size_on_disk(path) == good_size);              // truncated to last good offset
-            CHECK(matches(sm, expected));
-            CHECK(sm.get(command{"GET", "torn", std::nullopt}) == "NOT_FOUND");
-
-            CHECK(log.append(put("after", "crash")) == n + 1); // resumes on a clean boundary
-        }
-        {
-            PersistentLog log;
-            log.open(path.string());
-            StateMachine sm;
-            CHECK(log.replay(sm) == n + 1);
-            CHECK(log.recovered_tail_bytes() == 0);
-            expected_t after = expected;
-            after["after"] = "crash";
-            after["torn"] = std::nullopt;
-            CHECK(matches(sm, after));
-        }
+        CHECK(size_on_disk(path) == good.size + cut);
+        check_tail_recovers(path, good.size, cut);
         ++cases;
     }
-    std::printf("  %d cut points checked (prefix: 1-%zu, body: %zu-%zu)\n",
-                cases, kFrameHeaderSize - 1, kFrameHeaderSize, torn_frame.size() - 1);
+    std::printf("  %d cut points checked (header: 1-%zu, body: %zu-%zu)\n", cases,
+                PersistentLog::kHeaderSize - 1, PersistentLog::kHeaderSize, torn_frame.size() - 1);
+}
+
+// A crash on some filesystems leaves zeros instead of a short file. Previously
+// this refused to start; it must now recover like a torn tail.
+static void test_zeroed_tail_recovery() {
+    std::puts("test_zeroed_tail_recovery");
+    const good_log good = write_good_log("zero_base");
+    for (std::size_t zeros : {1, 3, 7, 8, 9, 64, 4096}) {
+        const fs::path path = temp_log("zero_" + std::to_string(zeros));
+        fs::create_directories(path.parent_path());
+        fs::copy_file(good.path, path);
+        append_raw(path, std::string(zeros, '\0'));
+        check_tail_recovers(path, good.size, zeros);
+    }
+
+    // Zeros followed by real data are not a crash tail: discarding them would
+    // drop committed entries, so this must refuse to start.
+    const fs::path path = temp_log("zero_then_data");
+    fs::create_directories(path.parent_path());
+    fs::copy_file(good.path, path);
+    append_raw(path, std::string(16, '\0'));
+    append_raw(path, PersistentLog::encode_frame(log_entry{kCmds.size() + 1, 0, put("x", "y")}));
+    const std::string before = read_file(path);
+    const std::string err = replay_error(path);
+    CHECK(err.find("zero-filled header") != std::string::npos);
+    CHECK(err.find("byte offset " + std::to_string(good.size) + " ") != std::string::npos);
+    CHECK(read_file(path) == before);
+}
+
+// Flips one bit at `pos` in a copy of the good log; replay must refuse to
+// start, name the damaged frame's offset, and leave the file untouched.
+static void check_bit_flip_refused(const good_log& good, const std::string& name, std::uint64_t pos,
+                                   std::uint64_t frame_offset, const std::string& expect_in_error) {
+    const fs::path path = temp_log(name);
+    fs::create_directories(path.parent_path());
+    std::string bytes = read_file(good.path);
+    bytes[pos] = static_cast<char>(bytes[pos] ^ 0x10);
+    write_file(path, bytes);
+
+    const std::string err = replay_error(path);
+    CHECK(!err.empty());
+    CHECK(err.find(expect_in_error) != std::string::npos);
+    CHECK(err.find("byte offset " + std::to_string(frame_offset) + " ") != std::string::npos);
+    CHECK(read_file(path) == bytes);  // nothing truncated or rewritten
+    if (err.find(expect_in_error) == std::string::npos) { std::fprintf(stderr, "    error was: %s\n", err.c_str()); }
+}
+
+static void test_bit_flips_refuse_to_start() {
+    std::puts("test_bit_flips_refuse_to_start");
+    const good_log good = write_good_log("flip_base");
+    const std::uint64_t mid = good.frame_offsets[1];   // second of four entries
+    const std::uint64_t last = good.frame_offsets[3];  // final entry: still corrupt, not "torn"
+    const std::uint64_t h = PersistentLog::kHeaderSize;
+
+    check_bit_flip_refused(good, "flip_payload", mid + h + 2, mid, "checksum mismatch");
+    check_bit_flip_refused(good, "flip_crc", mid + 5, mid, "checksum mismatch");
+    check_bit_flip_refused(good, "flip_last_payload", good.size - 1, last, "checksum mismatch");
+    check_bit_flip_refused(good, "flip_last_crc", last + 4, last, "checksum mismatch");
 }
 
 static void test_corruption_refuses_to_start() {
     std::puts("test_corruption_refuses_to_start");
+    const good_log good = write_good_log("corrupt_base");
 
-    // Oversized length prefix in the middle of the file.
+    // Oversized length in the middle of the file.
     {
         const fs::path path = temp_log("corrupt_length");
-        {
-            PersistentLog log;
-            log.open(path.string());
-            StateMachine sm;
-            log.replay(sm);
-            log.append(put("a", "1"));
-        }
-        const std::uint64_t first_end = size_on_disk(path);
-        append_raw(path, std::string("\xFF\xFF\xFF\xFF", 4));
-        {
-            std::string good_frame;
-            serialize_entry(log_entry{2, 0, put("b", "2")}, good_frame);
-            append_raw(path, good_frame);
-        }
-        const std::uint64_t size_before = size_on_disk(path);
+        fs::create_directories(path.parent_path());
+        fs::copy_file(good.path, path);
+        append_raw(path, std::string("\xFF\xFF\xFF\xFF\x00\x00\x00\x00", 8));
+        append_raw(path, PersistentLog::encode_frame(log_entry{kCmds.size() + 1, 0, put("b", "2")}));
+        const std::string before = read_file(path);
         PersistentLog log;
         log.open(path.string());
         StateMachine sm;
         CHECK(throws_wal_error([&] { log.replay(sm); }));
-        CHECK(size_on_disk(path) == size_before);  // nothing discarded
+        CHECK(read_file(path) == before);  // nothing discarded
         CHECK(throws_wal_error([&] { log.append(put("x", "y")); }));
-        CHECK(first_end < size_before);
     }
 
-    // Well-formed frames whose indices skip (1, 3).
+    // Zero length with a non-zero CRC: never written by append.
+    {
+        const fs::path path = temp_log("corrupt_zero_len");
+        fs::create_directories(path.parent_path());
+        fs::copy_file(good.path, path);
+        append_raw(path, std::string("\x00\x00\x00\x00\x01\x00\x00\x00", 8));
+        CHECK(replay_error(path).find("zero length") != std::string::npos);
+    }
+
+    // Valid frames (correct CRCs) whose indices skip (1, 3).
     {
         const fs::path path = temp_log("corrupt_gap");
         fs::create_directories(path.parent_path());
-        std::string bytes;
-        serialize_entry(log_entry{1, 0, put("a", "1")}, bytes);
-        serialize_entry(log_entry{3, 0, put("b", "2")}, bytes);
+        const std::string bytes = PersistentLog::encode_frame(log_entry{1, 0, put("a", "1")})
+                                + PersistentLog::encode_frame(log_entry{3, 0, put("b", "2")});
         append_raw(path, bytes);
-        PersistentLog log;
-        log.open(path.string());
-        StateMachine sm;
-        CHECK(throws_wal_error([&] { log.replay(sm); }));
-        CHECK(size_on_disk(path) == bytes.size());
+        CHECK(replay_error(path).find("expected index 2") != std::string::npos);
+        CHECK(read_file(path) == bytes);
     }
 }
 
@@ -239,14 +384,18 @@ int main() {
         return 2;
     }
     g_tmp_root = tmpl;
-    for (const char* name : {"basic", "resume", "needs_replay", "torn_base", "corrupt_length"}) {
+    for (const char* name : {"basic", "resume", "needs_replay"}) {
         fs::create_directories(g_tmp_root / name);
     }
 
+    test_crc32c_known_answers();
+    test_frame_layout();
     test_append_reopen_replay();
     test_index_resumes_after_reopen();
     test_append_requires_replay();
     test_torn_tail_recovery();
+    test_zeroed_tail_recovery();
+    test_bit_flips_refuse_to_start();
     test_corruption_refuses_to_start();
 
     fs::remove_all(g_tmp_root);

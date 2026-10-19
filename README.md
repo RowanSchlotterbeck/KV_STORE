@@ -21,7 +21,12 @@ bench/          Benchmark programs
   against the process-wide store; this is what the server calls per request.
 - `wal.{h,cpp}` — `PersistentLog`: append-only, fsync-per-write command
   log. Writes are logged before they are applied; the server replays it on
-  startup (`kv_server [log_path]`, default `data/kvstore.log`).
+  startup (`kv_server [log_path]`, default `data/kvstore.log`). Each entry
+  is framed as `[u32 length][u32 CRC32C][payload]` (format in `wal.h`); a
+  torn or zero-filled tail is truncated on replay, while a checksum mismatch
+  stops startup.
+- `crc32c.{h,cpp}` — CRC32C (Castagnoli), hardware-accelerated when the
+  target supports it, with a table-driven fallback.
 - `src/server.cpp` / `src/client.cpp` — Asio TCP server and a simple
   interactive client, both built on `kv_core`.
 

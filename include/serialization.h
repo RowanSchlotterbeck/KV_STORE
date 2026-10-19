@@ -36,4 +36,11 @@ bool serialize_entry(const log_entry& entry, std::string& out);
 // Never reads outside `buf`.
 decode_status deserialize_entry(std::string_view buf, std::size_t& offset, log_entry& out);
 
+// Unframed payload codec: just the serialized kvstore.LogEntry bytes, for
+// callers that define their own framing (e.g. the persistent log, which adds
+// a checksum). encode returns false if the payload would exceed
+// kMaxEntryPayloadSize; decode returns false if `payload` doesn't parse.
+bool encode_entry_payload(const log_entry& entry, std::string& payload);
+bool decode_entry_payload(std::string_view payload, log_entry& out);
+
 #endif //KV_STORE_SERIALIZATION_H

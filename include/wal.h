@@ -5,6 +5,7 @@
 #ifndef KV_STORE_WAL_H
 #define KV_STORE_WAL_H
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -20,8 +21,18 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// Append-only command log. The file is a concatenation of serialize_entry()
-// frames (see serialization.h); every append is fsynced before it returns.
+// Append-only command log; every append is fsynced before it returns.
+//
+// On-disk format: a concatenation of frames, no file header.
+//
+//   offset 0  u32 little-endian  length  payload size in bytes (never 0)
+//   offset 4  u32 little-endian  crc     CRC32C of the payload bytes only
+//   offset 8  length bytes       payload serialized kvstore.LogEntry
+//
+// The CRC covers the payload, not the length field. A corrupted length is
+// still caught: it makes replay checksum the wrong byte range, which fails
+// the check. The exception is a length that points past end-of-file, which
+// is indistinguishable from a torn final write and is treated as one.
 //
 // Lifecycle: open() -> replay() -> append()... append() refuses to run until
 // replay() has established last_index(), so indices are never reused.
@@ -29,6 +40,11 @@ class PersistentLog
 {
 public:
     static constexpr const char* kDefaultPath = "data/kvstore.log";
+    static constexpr std::size_t kHeaderSize = 8;
+
+    // Encodes one frame in the format above. Throws wal_error if the entry
+    // is too large. Exposed for tests and tooling.
+    static std::string encode_frame(const log_entry& entry);
 
     PersistentLog() = default;
     ~PersistentLog();
@@ -41,8 +57,9 @@ public:
     bool is_open() const { return fd_ >= 0; }
 
     // Applies every complete entry to `sm` in order and returns the last index.
-    // A torn final entry (crash mid-append) is cut off so the next append
-    // starts on a clean boundary. Mid-file corruption throws wal_error.
+    // A torn final entry or a zero-filled tail (crash mid-append) is cut off
+    // so the next append starts on a clean boundary. A checksum mismatch or
+    // other mid-file corruption throws wal_error and leaves the file as is.
     std::uint64_t replay(StateMachine& sm);
 
     // Durably appends `cmd` as the next entry (term 0 until Raft assigns terms)
@@ -51,7 +68,7 @@ public:
     std::uint64_t append(const command& cmd);
 
     std::uint64_t last_index() const { return last_index_; }
-    // Bytes of torn tail discarded by the last replay(); 0 for a clean log.
+    // Bytes of torn or zeroed tail discarded by the last replay(); 0 if clean.
     std::uint64_t recovered_tail_bytes() const { return recovered_tail_bytes_; }
 
 private:

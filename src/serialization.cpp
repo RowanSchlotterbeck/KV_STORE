@@ -37,6 +37,19 @@ log_entry from_proto(const kvstore::LogEntry& pb) {
     return entry;
 }
 
+bool encode_entry_payload(const log_entry& entry, std::string& payload) {
+    if (!to_proto(entry).SerializeToString(&payload)) { return false; }
+    return payload.size() <= kMaxEntryPayloadSize;
+}
+
+bool decode_entry_payload(std::string_view payload, log_entry& out) {
+    if (payload.size() > kMaxEntryPayloadSize) { return false; }
+    kvstore::LogEntry pb;
+    if (!pb.ParseFromArray(payload.data(), static_cast<int>(payload.size()))) { return false; }
+    out = from_proto(pb);
+    return true;
+}
+
 bool serialize_entry(const log_entry& entry, std::string& out) {
     std::string payload;
     if (!to_proto(entry).SerializeToString(&payload)) { return false; }

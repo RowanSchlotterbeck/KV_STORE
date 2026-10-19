@@ -30,6 +30,7 @@ add_library(kv_core
         src/engine.cpp
         src/serialization.cpp
         src/wal.cpp
+        src/crc32c.cpp
 )
 
 target_include_directories(kv_core PRIVATE
