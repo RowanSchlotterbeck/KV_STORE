@@ -122,9 +122,8 @@ static void test_append_entries_with_entries() {
         log_entry{11, 4, command{"PUT", "user", std::string("alice")}},
         log_entry{12, 4, command{"PUT", "empty", std::string{}}},
         log_entry{13, 4, command{"DEL", "user", std::nullopt}},
-        // Non-ASCII UTF-8 and an embedded NUL. (Command.key/value are proto3
-        // `string`, so non-UTF-8 bytes are rejected on parse; not exercised here.)
-        log_entry{14, 4, command{"PUT", "caf\xC3\xA9", std::string("\xC3\xA9\x00t", 4)}},
+        // Arbitrary bytes: invalid UTF-8 and an embedded NUL.
+        log_entry{14, 4, command{"PUT", "k\xFF", std::string("\x00\xFF\xC3", 3)}},
     };
     check_round_trip(req);
 
@@ -138,7 +137,8 @@ static void test_append_entries_with_entries() {
         CHECK(back.entries[1].cmd.value == "");         // ...and empty
         CHECK(back.entries[2].cmd.operation == "DEL");
         CHECK(!back.entries[2].cmd.value.has_value());  // DEL: absent
-        CHECK(back.entries[3].cmd.value == std::string("\xC3\xA9\x00t", 4));
+        CHECK(back.entries[3].cmd.key == "k\xFF");
+        CHECK(back.entries[3].cmd.value == std::string("\x00\xFF\xC3", 3));
         for (std::size_t i = 0; i < 4; ++i) {
             CHECK(back.entries[i].index == 11 + i);
             CHECK(back.entries[i].term == 4);

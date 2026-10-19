@@ -128,6 +128,31 @@ static void test_oversized_length_is_corrupt() {
     CHECK(offset == 0);
 }
 
+// Keys and values are arbitrary bytes: the line protocol accepts any byte,
+// so encoding must not depend on them being valid UTF-8.
+static void test_non_utf8_bytes_round_trip() {
+    std::puts("test_non_utf8_bytes_round_trip");
+    std::string all_bytes;
+    for (int b = 0; b < 256; ++b) { all_bytes.push_back(static_cast<char>(b)); }
+    const std::vector<log_entry> entries = {
+        make_entry(1, 1, {"PUT", "bin", "\xFF"}),                  // lone invalid byte
+        make_entry(2, 1, {"PUT", "\xFF\xFE", "\xC3"}),            // invalid key, truncated sequence
+        make_entry(3, 1, {"PUT", "\x80key", all_bytes}),            // every byte value
+        make_entry(4, 1, {"DEL", "\xFF\xFE", std::nullopt}),
+    };
+
+    std::string buf;
+    for (const auto& e : entries) { CHECK(serialize_entry(e, buf)); }
+    std::size_t offset = 0;
+    for (const auto& expected : entries) {
+        log_entry got;
+        CHECK(deserialize_entry(buf, offset, got) == decode_status::ok);
+        CHECK(got.cmd.key == expected.cmd.key);
+        CHECK(got.cmd.value == expected.cmd.value);
+    }
+    CHECK(offset == buf.size());
+}
+
 int main() {
     test_put_with_value();
     test_del_value_absent();
@@ -135,6 +160,7 @@ int main() {
     test_multiple_entries_in_order();
     test_truncated_final_entry();
     test_oversized_length_is_corrupt();
+    test_non_utf8_bytes_round_trip();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

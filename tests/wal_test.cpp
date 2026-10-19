@@ -116,6 +116,31 @@ static void test_index_resumes_after_reopen() {
     CHECK(matches(sm, {{"k0", "b"}, {"k1", "b"}, {"k2", "b"}}));
 }
 
+// Regression: a value that isn't valid UTF-8 used to be logged and acked,
+// then make replay refuse to start ("undecodable payload").
+static void test_non_utf8_survives_replay() {
+    std::puts("test_non_utf8_survives_replay");
+    std::string all_bytes;
+    for (int b = 0; b < 256; ++b) { all_bytes.push_back(static_cast<char>(b)); }
+    const fs::path path = temp_log("non_utf8");
+    {
+        PersistentLog log;
+        log.open(path.string());
+        StateMachine sm;
+        log.replay(sm);
+        log.append(put("bin", "\xFF"));
+        log.append(put("k\xFF\xFE", "\xC3"));
+        log.append(put("all", all_bytes));
+        log.append(put("doomed\x80", "x"));
+        log.append(del("doomed\x80"));
+    }
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    CHECK(log.replay(sm) == 5);
+    CHECK(matches(sm, {{"bin", "\xFF"}, {"k\xFF\xFE", "\xC3"}, {"all", all_bytes}, {"doomed\x80", std::nullopt}}));
+}
+
 static void test_append_requires_replay() {
     std::puts("test_append_requires_replay");
     PersistentLog log;
@@ -384,7 +409,7 @@ int main() {
         return 2;
     }
     g_tmp_root = tmpl;
-    for (const char* name : {"basic", "resume", "needs_replay"}) {
+    for (const char* name : {"basic", "resume", "needs_replay", "non_utf8"}) {
         fs::create_directories(g_tmp_root / name);
     }
 
@@ -393,6 +418,7 @@ int main() {
     test_append_reopen_replay();
     test_index_resumes_after_reopen();
     test_append_requires_replay();
+    test_non_utf8_survives_replay();
     test_torn_tail_recovery();
     test_zeroed_tail_recovery();
     test_bit_flips_refuse_to_start();
