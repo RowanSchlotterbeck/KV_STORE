@@ -20,7 +20,22 @@ add_custom_command(
         VERBATIM
 )
 
-add_library(kv_proto STATIC ${KV_PROTO_OUT}/kvstore.pb.cc)
+set(KV_RAFT_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto)
+add_custom_command(
+        OUTPUT ${KV_PROTO_OUT}/raft.pb.cc ${KV_PROTO_OUT}/raft.pb.h
+        COMMAND $<TARGET_FILE:protobuf::protoc>
+                --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+                --cpp_out=${KV_PROTO_OUT}
+                ${KV_RAFT_PROTO_SRC}
+        DEPENDS ${KV_RAFT_PROTO_SRC} ${KV_PROTO_SRC} protobuf::protoc
+        COMMENT "Generating C++ from raft.proto"
+        VERBATIM
+)
+
+add_library(kv_proto STATIC
+        ${KV_PROTO_OUT}/kvstore.pb.cc
+        ${KV_PROTO_OUT}/raft.pb.cc
+)
 target_include_directories(kv_proto PUBLIC ${KV_PROTO_OUT})
 target_link_libraries(kv_proto PUBLIC protobuf::libprotobuf)
 
@@ -31,6 +46,7 @@ add_library(kv_core
         src/serialization.cpp
         src/wal.cpp
         src/crc32c.cpp
+        src/raft_convert.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -136,3 +152,15 @@ target_include_directories(kv_wal_test PRIVATE
 )
 
 add_test(NAME wal COMMAND kv_wal_test)
+
+add_executable(kv_raft_messages_test
+        tests/raft_messages_test.cpp
+)
+
+target_link_libraries(kv_raft_messages_test PRIVATE kv_core kv_proto)
+
+target_include_directories(kv_raft_messages_test PRIVATE
+        include
+)
+
+add_test(NAME raft_messages COMMAND kv_raft_messages_test)
