@@ -68,6 +68,8 @@ public:
     std::uint64_t append(const command& cmd);
 
     std::uint64_t last_index() const { return last_index_; }
+    // Term of the last entry (0 for an empty log). Raft's up-to-date check uses this.
+    std::uint64_t last_term() const { return last_term_; }
     // Bytes of torn or zeroed tail discarded by the last replay(); 0 if clean.
     std::uint64_t recovered_tail_bytes() const { return recovered_tail_bytes_; }
 
@@ -77,6 +79,7 @@ private:
     int fd_ = -1;
     std::string path_;
     std::uint64_t last_index_ = 0;
+    std::uint64_t last_term_ = 0;
     std::uint64_t end_offset_ = 0;  // file offset just past the last good entry
     std::uint64_t recovered_tail_bytes_ = 0;
     bool replayed_ = false;

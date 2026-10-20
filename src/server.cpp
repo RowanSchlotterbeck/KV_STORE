@@ -6,6 +6,7 @@
 #include <optional>
 #include "../include/wal.h"
 #include "peer_transport.h"
+#include "../include/raft_node.h"
 
 
 using asio::ip::tcp;
@@ -54,7 +55,7 @@ private:
 
 class Server {
 public:
-    Server(asio::io_context& io, short port)
+    Server(asio::io_context& io, std::uint16_t port)
         : acceptor_(io, tcp::endpoint(tcp::v4(), port)) {
         accept();
     }
@@ -74,7 +75,8 @@ private:
 };
 
 static int usage(const char* prog) {
-    std::cerr << "usage: " << prog << " [log_path] [--cluster <config_file> --node-id <id>]\n";
+    std::cerr << "usage: " << prog
+              << " [log_path] [--cluster <config_file> --node-id <id>] [--client-port <port>]\n";
     return 2;
 }
 
@@ -82,12 +84,21 @@ int main(int argc, char** argv) {
     std::string log_path = PersistentLog::kDefaultPath;
     std::optional<std::string> cluster_path;
     std::optional<std::string> node_id_arg;
+    std::uint16_t client_port = 5555;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--cluster" && i + 1 < argc) {
             cluster_path = argv[++i];
         } else if (arg == "--node-id" && i + 1 < argc) {
             node_id_arg = argv[++i];
+        } else if (arg == "--client-port" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            unsigned long port = 0;
+            try { port = std::stoul(value); } catch (const std::exception&) {}
+            if (port == 0 || port > 65535 || value.find_first_not_of("0123456789") != std::string::npos) {
+                return usage(argv[0]);
+            }
+            client_port = static_cast<std::uint16_t>(port);
         } else if (i == 1 && arg.rfind("--", 0) != 0) {
             log_path = arg;
         } else {
@@ -124,25 +135,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Peer RPC listener and client share the one io_context. Handlers are
-    // stubs until Raft lands; the client is ready for it but not yet used.
-    std::optional<PeerServer> peer_server;
+    // Raft election runs on the same io_context as the client protocol.
+    // Destruction order matters: peer_server (holds raft's handlers) goes
+    // first, then raft, then the client raft sends through.
     std::optional<ConnectPerRpcClient> peer_client;
+    std::optional<RaftNode> raft;
+    std::optional<PeerServer> peer_server;
     if (cluster) {
         const auto& self = endpoints.at(cluster->self_id());
+        // Replies slower than the shortest election timeout are stale anyway.
+        peer_client.emplace(io, endpoints, kElectionTimeoutMin);
+        raft.emplace(io, cluster->self_id(), cluster->peers(), *peer_client, [] {
+            const engine_log_position pos = engine_last_log_position();
+            return log_position{pos.last_index, pos.last_term};
+        });
         try {
-            peer_server.emplace(io, self, stub_peer_handlers());
+            peer_server.emplace(io, self, raft->handlers());
         } catch (const std::system_error& e) {
             std::cerr << "Failed to listen for peers on " << self << ": " << e.what() << "\n";
             return 1;
         }
-        peer_client.emplace(io, endpoints);
         std::cout << "Node " << cluster->self_id() << " peer RPC listening on " << self << " (peers:";
         for (const node_id peer : cluster->peers()) { std::cout << " " << peer; }
         std::cout << ")\n";
+        raft->start();
     }
 
-    Server server(io, 5555);
-    std::cout << "KV server listening on port 5555\n";
+    Server server(io, client_port);
+    std::cout << "KV server listening on port " << client_port << "\n";
     io.run();
 }

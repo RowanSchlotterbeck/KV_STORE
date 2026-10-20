@@ -102,6 +102,7 @@ void PersistentLog::open(const std::string& path) {
     fd_ = fd;
     path_ = path;
     last_index_ = 0;
+    last_term_ = 0;
     end_offset_ = 0;
     recovered_tail_bytes_ = 0;
     replayed_ = false;
@@ -144,6 +145,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
     const std::size_t size = buf.size();
     std::size_t offset = 0;
     std::uint64_t last = 0;
+    std::uint64_t last_term = 0;
     const auto corrupt = [&](const std::string& why) {
         return wal_error("corrupt log " + path_ + ": " + why + " in entry at byte offset "
                          + std::to_string(offset) + " of " + std::to_string(size)
@@ -190,6 +192,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
 
         sm.apply(entry.cmd);
         last = entry.index;
+        last_term = entry.term;
         offset += kHeaderSize + len;
     }
 
@@ -202,6 +205,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
     }
 
     last_index_ = last;
+    last_term_ = last_term;
     end_offset_ = offset;
     replayed_ = true;
     return last_index_;
@@ -247,4 +251,5 @@ void PersistentLog::append_entry(const log_entry& entry) {
 
     end_offset_ += frame.size();
     last_index_ = entry.index;
+    last_term_ = entry.term;
 }

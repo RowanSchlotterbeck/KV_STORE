@@ -34,7 +34,9 @@ bench/          Benchmark programs
 - `network/peer_transport.h`, `src/peer_transport.cpp` — peer RPC
   listener (`PeerServer`) and connect-per-RPC client
   (`ConnectPerRpcClient`), both on the server's single `io_context`.
-  Handlers are stubs for now; no Raft logic yet.
+- `raft_node.{h,cpp}` — `RaftNode`: Raft leader election and heartbeats
+  (Figure 2) on the same `io_context`, driven by two Asio timers. Election
+  only: no log replication or commit index yet.
 - `src/server.cpp` / `src/client.cpp` — Asio TCP server and a simple
   interactive client, both built on `kv_core`.
 
@@ -68,11 +70,16 @@ This produces:
 ```
 
 With `--cluster <file> --node-id <id>` the server also listens for peer RPCs
-on that node's `peer_port` from the config (the client protocol stays on
-5555). Without those flags it runs single-node, exactly as before.
+on that node's `peer_port` from the config and takes part in leader election,
+logging role and term changes to stderr. `--client-port <port>` (default
+5555) lets several nodes share one machine. Without `--cluster` it runs
+single-node, exactly as before.
 
 ```
-./build/kv_server data/node1.log --cluster config/cluster.example.conf --node-id 1
+# three terminals
+./build/kv_server data/n1.log --cluster config/cluster.example.conf --node-id 1 --client-port 5551
+./build/kv_server data/n2.log --cluster config/cluster.example.conf --node-id 2 --client-port 5552
+./build/kv_server data/n3.log --cluster config/cluster.example.conf --node-id 3 --client-port 5553
 ```
 
 Or talk to it directly with `nc`:
@@ -157,8 +164,11 @@ round trip, not the engine, is the bottleneck for real client traffic.
 
 ## Known limitations
 
-- No replication yet: the peer transport exists, but its handlers are
-  stubs and nothing sends RPCs. Every write is fsynced individually (no batching), so
+- Cluster mode elects a leader but does not replicate: each node still
+  applies client writes to its own log, wherever they arrive. Raft's
+  `currentTerm`/`votedFor` are kept in memory only, so a node restarted
+  mid-term can vote twice in that term (to be fixed before replication).
+  Every write is fsynced individually (no batching), so
   write throughput is bounded by disk sync latency.
 - No authentication, TLS, or multi-database support.
 - The server handles one line per read/write cycle per connection with

@@ -141,6 +141,29 @@ static void test_non_utf8_survives_replay() {
     CHECK(matches(sm, {{"bin", "\xFF"}, {"k\xFF\xFE", "\xC3"}, {"all", all_bytes}, {"doomed\x80", std::nullopt}}));
 }
 
+// last_term() reports the final entry's term after replay (Raft's up-to-date
+// check reads it), and 0 for an empty log.
+static void test_last_term_after_replay() {
+    std::puts("test_last_term_after_replay");
+    const fs::path path = temp_log("last_term");
+    {
+        PersistentLog log;
+        log.open(path.string());
+        StateMachine sm;
+        CHECK(log.replay(sm) == 0);
+        CHECK(log.last_index() == 0 && log.last_term() == 0);
+    }
+    append_raw(path, PersistentLog::encode_frame(log_entry{1, 3, put("a", "1")})
+                   + PersistentLog::encode_frame(log_entry{2, 5, put("b", "2")}));
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    CHECK(log.replay(sm) == 2);
+    CHECK(log.last_index() == 2 && log.last_term() == 5);
+    CHECK(log.append(put("c", "3")) == 3);  // appends still write term 0 for now
+    CHECK(log.last_term() == 0);
+}
+
 static void test_append_requires_replay() {
     std::puts("test_append_requires_replay");
     PersistentLog log;
@@ -409,7 +432,7 @@ int main() {
         return 2;
     }
     g_tmp_root = tmpl;
-    for (const char* name : {"basic", "resume", "needs_replay", "non_utf8"}) {
+    for (const char* name : {"basic", "resume", "needs_replay", "non_utf8", "last_term"}) {
         fs::create_directories(g_tmp_root / name);
     }
 
@@ -418,6 +441,7 @@ int main() {
     test_append_reopen_replay();
     test_index_resumes_after_reopen();
     test_append_requires_replay();
+    test_last_term_after_replay();
     test_non_utf8_survives_replay();
     test_torn_tail_recovery();
     test_zeroed_tail_recovery();

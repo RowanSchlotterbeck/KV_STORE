@@ -50,6 +50,7 @@ add_library(kv_core
         src/rpc_frame.cpp
         src/peer_config.cpp
         src/peer_transport.cpp
+        src/raft_node.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -187,3 +188,22 @@ target_compile_definitions(kv_peer_transport_test PRIVATE
 add_test(NAME peer_transport COMMAND kv_peer_transport_test)
 # Backstop: a hung network test fails instead of stalling the suite.
 set_tests_properties(peer_transport PROPERTIES TIMEOUT 60)
+
+add_executable(kv_raft_election_test
+        tests/raft_election_test.cpp
+)
+
+target_link_libraries(kv_raft_election_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_raft_election_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_raft_election_test PRIVATE
+        ASIO_STANDALONE
+)
+
+add_test(NAME raft_election COMMAND kv_raft_election_test)
+set_tests_properties(raft_election PROPERTIES TIMEOUT 120)
