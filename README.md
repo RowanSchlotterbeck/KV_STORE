@@ -27,6 +27,14 @@ bench/          Benchmark programs
   stops startup.
 - `crc32c.{h,cpp}` — CRC32C (Castagnoli), hardware-accelerated when the
   target supports it, with a table-driven fallback.
+- `rpc_frame.{h,cpp}` — framing for node-to-node Raft RPCs:
+  `[u32 length][u8 type tag][protobuf payload]` (format in `rpc_frame.h`).
+- `peer_config.{h,cpp}` — static cluster config (`<node_id> <host>
+  <peer_port>` per line; see `config/cluster.example.conf`).
+- `network/peer_transport.h`, `src/peer_transport.cpp` — peer RPC
+  listener (`PeerServer`) and connect-per-RPC client
+  (`ConnectPerRpcClient`), both on the server's single `io_context`.
+  Handlers are stubs for now; no Raft logic yet.
 - `src/server.cpp` / `src/client.cpp` — Asio TCP server and a simple
   interactive client, both built on `kv_core`.
 
@@ -57,6 +65,14 @@ This produces:
 ```
 ./build/kv_server &
 ./build/kv_client
+```
+
+With `--cluster <file> --node-id <id>` the server also listens for peer RPCs
+on that node's `peer_port` from the config (the client protocol stays on
+5555). Without those flags it runs single-node, exactly as before.
+
+```
+./build/kv_server data/node1.log --cluster config/cluster.example.conf --node-id 1
 ```
 
 Or talk to it directly with `nc`:
@@ -141,7 +157,8 @@ round trip, not the engine, is the bottleneck for real client traffic.
 
 ## Known limitations
 
-- Single node only. Every write is fsynced individually (no batching), so
+- No replication yet: the peer transport exists, but its handlers are
+  stubs and nothing sends RPCs. Every write is fsynced individually (no batching), so
   write throughput is bounded by disk sync latency.
 - No authentication, TLS, or multi-database support.
 - The server handles one line per read/write cycle per connection with

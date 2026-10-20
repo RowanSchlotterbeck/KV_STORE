@@ -47,6 +47,9 @@ add_library(kv_core
         src/wal.cpp
         src/crc32c.cpp
         src/raft_convert.cpp
+        src/rpc_frame.cpp
+        src/peer_config.cpp
+        src/peer_transport.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -164,3 +167,23 @@ target_include_directories(kv_raft_messages_test PRIVATE
 )
 
 add_test(NAME raft_messages COMMAND kv_raft_messages_test)
+
+add_executable(kv_peer_transport_test
+        tests/peer_transport_test.cpp
+)
+
+target_link_libraries(kv_peer_transport_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_peer_transport_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_peer_transport_test PRIVATE
+        ASIO_STANDALONE
+)
+
+add_test(NAME peer_transport COMMAND kv_peer_transport_test)
+# Backstop: a hung network test fails instead of stalling the suite.
+set_tests_properties(peer_transport PROPERTIES TIMEOUT 60)
