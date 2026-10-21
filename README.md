@@ -37,6 +37,9 @@ bench/          Benchmark programs
 - `raft_node.{h,cpp}` — `RaftNode`: Raft leader election and heartbeats
   (Figure 2) on the same `io_context`, driven by two Asio timers. Election
   only: no log replication or commit index yet.
+- `network/status_server.h`, `src/status_server.cpp` — `StatusServer`: a
+  minimal read-only HTTP listener for the `/status` endpoint (below), on the
+  same `io_context`.
 - `src/server.cpp` / `src/client.cpp` — Asio TCP server and a simple
   interactive client, both built on `kv_core`.
 
@@ -104,6 +107,50 @@ as before.
 ./build/kv_server data/n2.log --cluster config/cluster.example.conf --node-id 2
 ./build/kv_server data/n3.log --cluster config/cluster.example.conf --node-id 3
 ```
+
+### Status endpoint
+
+`--status-port <port>` (cluster mode only; off by default) starts a read-only
+HTTP listener on `127.0.0.1:<port>` for dashboards. It must differ from this
+node's client port and from every peer/client port the config lists for the
+same host; a clash, or a port already in use, stops startup. Without the
+flag nothing extra listens and the node behaves exactly as before.
+
+```
+./build/kv_server data/n1.log --cluster config/cluster.example.conf --node-id 1 --status-port 8081
+curl http://127.0.0.1:8081/status
+```
+
+- `GET /status` → `200 application/json`
+- `GET /healthz` → `200 ok`
+- any other method → `405`; unknown path → `404`; malformed request → `400`
+
+The `/status` body is one JSON object:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `node_id` | uint | this node |
+| `role` | string | `"follower"`, `"candidate"` or `"leader"` |
+| `current_term` | uint | current term |
+| `leader_id` | uint | leader known for this term, `0` if none |
+| `log_last_index` | uint | index of the last entry in this node's log |
+| `commit_index` | uint | highest index known committed |
+| `last_applied` | uint | highest index applied to the store |
+| `peers` | array | leader: `{"id", "nextIndex", "matchIndex"}` per follower; `[]` on other roles |
+| `seq` | uint | count of `/status` responses from this process (tells polls apart) |
+| `timestamp_ms` | uint | wall-clock Unix time of the response, in ms |
+
+```
+{"node_id":2,"role":"leader","current_term":1,"leader_id":2,"log_last_index":2,"commit_index":2,"last_applied":2,"peers":[{"id":1,"nextIndex":3,"matchIndex":2},{"id":3,"nextIndex":3,"matchIndex":2}],"seq":2,"timestamp_ms":1792615816600}
+```
+
+It is purely an observer. It runs on the node's single event loop, so each
+response is a consistent snapshot taken between Raft steps. It reads only
+in-memory state: no disk, no RPCs, no waiting. Each connection carries one
+request, and a client that doesn't finish within 2s is dropped. `/status`
+sends `Access-Control-Allow-Origin: *` so a browser dashboard on another
+origin can poll it. That is intended for local demos: the data is read-only,
+but there is no authentication.
 
 Or talk to it directly with `nc`:
 

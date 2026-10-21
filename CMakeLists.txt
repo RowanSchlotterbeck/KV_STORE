@@ -53,6 +53,7 @@ add_library(kv_core
         src/peer_transport.cpp
         src/raft_node.cpp
         src/raft_state.cpp
+        src/status_server.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -228,3 +229,25 @@ target_compile_definitions(kv_raft_state_test PRIVATE
 
 add_test(NAME raft_state COMMAND kv_raft_state_test)
 set_tests_properties(raft_state PROPERTIES TIMEOUT 60)
+
+
+add_executable(kv_status_server_test
+        tests/status_server_test.cpp
+)
+
+target_link_libraries(kv_status_server_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_status_server_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_status_server_test PRIVATE
+        ASIO_STANDALONE
+)
+
+# Runs real kv_server nodes, so it needs the server built first.
+add_dependencies(kv_status_server_test kv_server)
+add_test(NAME status_server COMMAND kv_status_server_test $<TARGET_FILE:kv_server>)
+set_tests_properties(status_server PROPERTIES TIMEOUT 120)

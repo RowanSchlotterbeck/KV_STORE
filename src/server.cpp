@@ -7,6 +7,7 @@
 #include "../include/wal.h"
 #include "peer_transport.h"
 #include "../include/raft_node.h"
+#include "status_server.h"
 
 
 using asio::ip::tcp;
@@ -35,6 +36,38 @@ struct ClusterFrontEnd
         return reply;
     }
 };
+
+// The /status body (schema in README.md, "Status endpoint"). Reads only
+// in-memory fields; called on the io_context thread, between Raft handlers,
+// so the fields come from one consistent point in time. peers lists the
+// leader's per-follower progress and is [] on a non-leader. seq counts
+// responses from this process; timestamp_ms is wall-clock Unix time.
+static std::string status_json(const RaftNode& raft, const RaftLog& log, std::uint64_t seq) {
+    const raft_status st = raft.status();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch());
+    std::string out = "{";
+    out += "\"node_id\":" + std::to_string(st.id);
+    out += ",\"role\":\"" + std::string(to_string(st.role)) + "\"";
+    out += ",\"current_term\":" + std::to_string(st.term);
+    out += ",\"leader_id\":" + std::to_string(st.leader_id);
+    out += ",\"log_last_index\":" + std::to_string(log.last().last_index);
+    out += ",\"commit_index\":" + std::to_string(raft.commit_index());
+    out += ",\"last_applied\":" + std::to_string(raft.last_applied());
+    out += ",\"peers\":[";
+    bool first = true;
+    for (const auto& [id, p] : raft.progress()) {
+        if (!first) { out += ","; }
+        first = false;
+        out += "{\"id\":" + std::to_string(id) + ",\"nextIndex\":" + std::to_string(p.next_index)
+               + ",\"matchIndex\":" + std::to_string(p.match_index) + "}";
+    }
+    out += "]";
+    out += ",\"seq\":" + std::to_string(seq);
+    out += ",\"timestamp_ms\":" + std::to_string(now.count());
+    out += "}";
+    return out;
+}
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -145,9 +178,20 @@ private:
     const ClusterFrontEnd* cluster_;
 };
 
+// A decimal TCP port, 1-65535.
+static std::optional<std::uint16_t> parse_port(const std::string& value) {
+    unsigned long port = 0;
+    try { port = std::stoul(value); } catch (const std::exception&) {}
+    if (port == 0 || port > 65535 || value.find_first_not_of("0123456789") != std::string::npos) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint16_t>(port);
+}
+
 static int usage(const char* prog) {
     std::cerr << "usage: " << prog
-              << " [log_path] [--cluster <config_file> --node-id <id>] [--client-port <port>]\n";
+              << " [log_path] [--cluster <config_file> --node-id <id>] [--client-port <port>]"
+                 " [--status-port <port>]\n";
     return 2;
 }
 
@@ -157,6 +201,7 @@ int main(int argc, char** argv) {
     std::optional<std::string> node_id_arg;
     std::uint16_t client_port = 5555;
     bool client_port_given = false;
+    std::optional<std::uint16_t> status_port;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--cluster" && i + 1 < argc) {
@@ -164,14 +209,13 @@ int main(int argc, char** argv) {
         } else if (arg == "--node-id" && i + 1 < argc) {
             node_id_arg = argv[++i];
         } else if (arg == "--client-port" && i + 1 < argc) {
-            const std::string value = argv[++i];
-            unsigned long port = 0;
-            try { port = std::stoul(value); } catch (const std::exception&) {}
-            if (port == 0 || port > 65535 || value.find_first_not_of("0123456789") != std::string::npos) {
-                return usage(argv[0]);
-            }
-            client_port = static_cast<std::uint16_t>(port);
+            const auto port = parse_port(argv[++i]);
+            if (!port) { return usage(argv[0]); }
+            client_port = *port;
             client_port_given = true;
+        } else if (arg == "--status-port" && i + 1 < argc) {
+            status_port = parse_port(argv[++i]);
+            if (!status_port) { return usage(argv[0]); }
         } else if (i == 1 && arg.rfind("--", 0) != 0) {
             log_path = arg;
         } else {
@@ -179,6 +223,11 @@ int main(int argc, char** argv) {
         }
     }
     if (cluster_path.has_value() != node_id_arg.has_value()) { return usage(argv[0]); }
+    // The status endpoint reports Raft state, so it exists only in cluster mode.
+    if (status_port && !cluster_path) {
+        std::cerr << "--status-port requires --cluster (the status endpoint reports Raft state)\n";
+        return 2;
+    }
 
     asio::io_context io;
 
@@ -203,6 +252,22 @@ int main(int argc, char** argv) {
             }
             client_port = *configured;
         }
+        // The status port must not be any port this node or a node on the
+        // same host already uses.
+        if (status_port) {
+            const std::string& host = cluster->self_address().host;
+            std::string clash;
+            if (*status_port == client_port) { clash = "this node's client port"; }
+            for (const auto& [id, addr] : cluster->nodes()) {
+                if (!clash.empty() || addr.host != host) { continue; }
+                if (addr.port == *status_port) { clash = "node " + std::to_string(id) + "'s peer port"; }
+                if (addr.client_port == *status_port) { clash = "node " + std::to_string(id) + "'s client port"; }
+            }
+            if (!clash.empty()) {
+                std::cerr << "--status-port " << *status_port << " collides with " << clash << " on " << host << "\n";
+                return 1;
+            }
+        }
     }
 
     try {
@@ -222,13 +287,15 @@ int main(int argc, char** argv) {
     }
 
     // Raft election runs on the same io_context as the client protocol.
-    // Destruction order matters: peer_server (holds raft's handlers) goes
-    // first, then raft, then the client raft sends through, then its state file.
+    // Destruction order matters: status_server (reads raft) and peer_server
+    // (holds raft's handlers) go first, then raft, then the client raft
+    // sends through, then its state file.
     std::optional<RaftStateFile> raft_state;
     PersistentRaftLog raft_log(engine_log());
     std::optional<ConnectPerRpcClient> peer_client;
     std::optional<RaftNode> raft;
     std::optional<PeerServer> peer_server;
+    std::optional<StatusServer> status_server;
     if (cluster) {
         const auto& self = endpoints.at(cluster->self_id());
         // Per-node by construction: each node already has its own log path.
@@ -253,6 +320,20 @@ int main(int argc, char** argv) {
         std::cout << "Node " << cluster->self_id() << " peer RPC listening on " << self << " (peers:";
         for (const node_id peer : cluster->peers()) { std::cout << " " << peer; }
         std::cout << ")\n";
+        // Read-only observability, opt-in. Its only access to Raft is the
+        // const reads in status_json(); it never changes what the node does.
+        if (status_port) {
+            const tcp::endpoint where(asio::ip::address_v4::loopback(), *status_port);
+            try {
+                status_server.emplace(io, where, [&raft, &raft_log, seq = std::uint64_t{0}]() mutable {
+                    return status_json(*raft, raft_log, ++seq);
+                });
+            } catch (const std::system_error& e) {
+                std::cerr << "Failed to listen for status requests on " << where << ": " << e.what() << "\n";
+                return 1;
+            }
+            std::cout << "status endpoint on http://127.0.0.1:" << *status_port << "/status\n";
+        }
         raft->start();
     }
 
