@@ -88,7 +88,7 @@ public:
 };
 
 // A log as a list of terms: terms[i - 1] is the term of entry i.
-struct FakeLog final : RaftLogView
+struct FakeLog final : RaftLog
 {
     std::vector<std::uint64_t> terms;
 
@@ -100,6 +100,10 @@ struct FakeLog final : RaftLogView
         if (index > terms.size()) { return std::nullopt; }
         return terms[index - 1];
     }
+    // These nodes never lead and are never sent entries.
+    std::vector<log_entry> entries(std::uint64_t, std::size_t, std::size_t) const override { return {}; }
+    void truncate_from(std::uint64_t) override {}
+    void append(std::span<const log_entry>) override {}
 };
 
 // One node "process": the state file object and the node built on it. A
@@ -265,7 +269,7 @@ static void test_vote_survives_restart() {
         raft_options o;
         o.election_timeout_min = o.election_timeout_max = 10s;
         o.log = kVerbose;
-        const FakeLog log;
+        FakeLog log;
         RaftNode before(io, 1, {2, 3}, c, log, o);
         CHECK(before.handle_request_vote({1, 2, 0, 0}).vote_granted);
     }
@@ -275,7 +279,7 @@ static void test_vote_survives_restart() {
         raft_options o;
         o.election_timeout_min = o.election_timeout_max = 10s;
         o.log = kVerbose;
-        const FakeLog log;
+        FakeLog log;
         RaftNode after(io, 1, {2, 3}, c, log, o);
         CHECK(after.handle_request_vote({1, 3, 0, 0}).vote_granted);  // second vote in term 1
     }

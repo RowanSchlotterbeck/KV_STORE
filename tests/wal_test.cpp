@@ -214,6 +214,187 @@ static void test_term_at() {
     CHECK(!log.term_at(8).has_value());
 }
 
+// ---- Raft-facing writes: entries with given index/term, truncation, reads ----
+
+static log_entry entry(std::uint64_t index, std::uint64_t term) {
+    return {index, term, put("k" + std::to_string(index), "v" + std::to_string(index) + "t" + std::to_string(term))};
+}
+
+static bool same_entry(const log_entry& a, const log_entry& b) {
+    return a.index == b.index && a.term == b.term && a.cmd.operation == b.cmd.operation
+        && a.cmd.key == b.cmd.key && a.cmd.value == b.cmd.value;
+}
+
+static bool same_entries(const std::vector<log_entry>& a, const std::vector<log_entry>& b) {
+    if (a.size() != b.size()) { return false; }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (!same_entry(a[i], b[i])) { return false; }
+    }
+    return true;
+}
+
+// Opens and replays `path`, returning the log's entries as read back from disk.
+static std::vector<log_entry> reopen_entries(const fs::path& path) {
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    const std::uint64_t n = log.replay(sm);
+    return log.read_entries(1, n + 1, SIZE_MAX);
+}
+
+static void test_append_entries_given_index_term() {
+    std::puts("test_append_entries_given_index_term");
+    const fs::path path = temp_log("given");
+    fs::create_directories(path.parent_path());
+    const std::vector<log_entry> batch = {entry(1, 1), entry(2, 1), entry(3, 2)};
+    {
+        PersistentLog log;
+        log.open(path.string());
+        StateMachine sm;
+        log.replay(sm);
+        log.append_entries(batch);
+        CHECK(log.last_index() == 3 && log.last_term() == 2);
+        log.append_entry(entry(4, 3));
+        CHECK(log.last_index() == 4 && log.last_term() == 3);
+        CHECK(log.term_at(1) == std::optional<std::uint64_t>(1) && log.term_at(4) == std::optional<std::uint64_t>(3));
+        // append(cmd) still continues the sequence, at term 0.
+        CHECK(log.append(put("plain", "x")) == 5);
+        CHECK(log.term_at(5) == std::optional<std::uint64_t>(0));
+        log.append_entries({});  // empty batch: no-op
+        CHECK(log.last_index() == 5);
+    }
+    // Round trip through the file: same indices, terms and commands.
+    const auto back = reopen_entries(path);
+    CHECK(back.size() == 5);
+    if (back.size() == 5) {
+        for (std::size_t i = 0; i < 3; ++i) { CHECK(same_entry(back[i], batch[i])); }
+        CHECK(same_entry(back[3], entry(4, 3)));
+        CHECK(back[4].index == 5 && back[4].term == 0 && back[4].cmd.key == "plain");
+    }
+    // A batch is byte-for-byte the frames encode_frame produces.
+    std::string expect;
+    for (const auto& e : batch) { expect += PersistentLog::encode_frame(e); }
+    std::ifstream in(path, std::ios::binary);
+    std::string head(expect.size(), '\0');
+    in.read(head.data(), static_cast<std::streamsize>(head.size()));
+    CHECK(head == expect);
+}
+
+static void test_append_entries_continuity() {
+    std::puts("test_append_entries_continuity");
+    const fs::path path = temp_log("continuity");
+    fs::create_directories(path.parent_path());
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    log.replay(sm);
+    log.append_entries(std::vector<log_entry>{entry(1, 1), entry(2, 1)});
+    const auto size = size_on_disk(path);
+
+    const std::vector<std::vector<log_entry>> bad = {
+        {entry(2, 1)},                 // repeats the last index
+        {entry(4, 1)},                 // skips index 3
+        {entry(1, 1)},                 // rewinds
+        {entry(3, 1), entry(5, 1)},    // gap inside the batch
+        {entry(3, 1), entry(3, 1)},    // duplicate inside the batch
+    };
+    for (const auto& b : bad) {
+        CHECK(throws_wal_error([&] { log.append_entries(b); }));
+        CHECK(size_on_disk(path) == size);  // nothing written
+        CHECK(log.last_index() == 2);
+    }
+    // A rejected batch doesn't disable the log (only I/O failures do).
+    log.append_entry(entry(3, 2));
+    CHECK(log.last_index() == 3);
+
+    PersistentLog unopened;
+    CHECK(throws_wal_error([&] { unopened.append_entry(entry(1, 1)); }));
+    CHECK(throws_wal_error([&] { unopened.truncate_from(1); }));
+}
+
+static void test_truncate_from() {
+    std::puts("test_truncate_from");
+    const fs::path path = temp_log("truncate");
+    fs::create_directories(path.parent_path());
+    std::vector<log_entry> six;
+    for (std::uint64_t i = 1; i <= 6; ++i) { six.push_back(entry(i, i <= 3 ? 1 : 2)); }
+    std::uint64_t three_frames = 0;
+    for (std::size_t i = 0; i < 3; ++i) { three_frames += PersistentLog::encode_frame(six[i]).size(); }
+    {
+        PersistentLog log;
+        log.open(path.string());
+        StateMachine sm;
+        log.replay(sm);
+        log.append_entries(six);
+
+        log.truncate_from(10);  // past the end: no-op
+        CHECK(log.last_index() == 6);
+        CHECK(throws_wal_error([&] { log.truncate_from(0); }));
+
+        log.truncate_from(4);   // deletes 4, 5, 6
+        CHECK(log.last_index() == 3 && log.last_term() == 1);
+        CHECK(log.term_at(3) == std::optional<std::uint64_t>(1));
+        CHECK(!log.term_at(4).has_value());
+        CHECK(size_on_disk(path) == three_frames);  // clean frame boundary
+        CHECK(log.read_entries(4, 10, SIZE_MAX).empty());
+        CHECK(same_entries(log.read_entries(1, 10, SIZE_MAX), {six[0], six[1], six[2]}));
+
+        // Appending after a truncation picks up at the cut, with new terms.
+        log.append_entries(std::vector<log_entry>{entry(4, 5), entry(5, 5)});
+        CHECK(log.last_index() == 5 && log.last_term() == 5);
+    }
+    // And all of it survives a reopen.
+    const auto back = reopen_entries(path);
+    CHECK(same_entries(back, {six[0], six[1], six[2], entry(4, 5), entry(5, 5)}));
+    {
+        PersistentLog log;
+        log.open(path.string());
+        StateMachine sm;
+        log.replay(sm);
+        log.truncate_from(1);   // everything
+        CHECK(log.last_index() == 0 && log.last_term() == 0 && size_on_disk(path) == 0);
+        log.append_entry(entry(1, 7));
+    }
+    CHECK(same_entries(reopen_entries(path), {entry(1, 7)}));
+}
+
+static void test_read_entries() {
+    std::puts("test_read_entries");
+    const fs::path path = temp_log("read_entries");
+    fs::create_directories(path.parent_path());
+    std::vector<log_entry> all;
+    for (std::uint64_t i = 1; i <= 10; ++i) { all.push_back(entry(i, (i + 1) / 2)); }
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    log.replay(sm);
+    CHECK(log.read_entries(1, 10, SIZE_MAX).empty());  // empty log
+    log.append_entries(all);
+    const std::size_t frame = PersistentLog::encode_frame(all[0]).size();  // all the same size
+
+    CHECK(same_entries(log.read_entries(1, 100, SIZE_MAX), all));
+    CHECK(same_entries(log.read_entries(4, 3, SIZE_MAX), {all[3], all[4], all[5]}));  // count cap
+    CHECK(same_entries(log.read_entries(9, 100, SIZE_MAX), {all[8], all[9]}));          // runs to the end
+    CHECK(log.read_entries(11, 5, SIZE_MAX).empty());
+    CHECK(log.read_entries(0, 5, SIZE_MAX).empty());
+    CHECK(log.read_entries(1, 0, SIZE_MAX).empty());
+    // Byte cap counts whole frames: exactly 3 frames fit, one byte less fits 2.
+    CHECK(log.read_entries(1, 100, 3 * frame).size() == 3);
+    CHECK(log.read_entries(1, 100, 3 * frame - 1).size() == 2);
+    // The first entry is returned even if it alone exceeds the cap.
+    CHECK(same_entries(log.read_entries(2, 100, 1), {all[1]}));
+
+    // Corruption after replay is caught on read, not shipped.
+    {
+        std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(static_cast<std::streamoff>(5 * frame + PersistentLog::kHeaderSize + 2));
+        f.put('\x7F');
+    }
+    CHECK(throws_wal_error([&] { log.read_entries(6, 1, SIZE_MAX); }));
+    CHECK(throws_wal_error([&] { log.read_entries(1, 10, SIZE_MAX); }));
+    CHECK(log.read_entries(1, 5, SIZE_MAX).size() == 5);  // the good prefix still reads
+}
+
 static void test_append_requires_replay() {
     std::puts("test_append_requires_replay");
     PersistentLog log;
@@ -493,6 +674,10 @@ int main() {
     test_append_requires_replay();
     test_last_term_after_replay();
     test_term_at();
+    test_append_entries_given_index_term();
+    test_append_entries_continuity();
+    test_truncate_from();
+    test_read_entries();
     test_non_utf8_survives_replay();
     test_torn_tail_recovery();
     test_zeroed_tail_recovery();

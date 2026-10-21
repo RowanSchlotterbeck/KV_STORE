@@ -1,14 +1,18 @@
 #ifndef KV_STORE_RAFT_NODE_H
 #define KV_STORE_RAFT_NODE_H
 
-// Raft leader election, heartbeats and the AppendEntries log-consistency
-// check (Raft paper, Figure 2), and nothing more: heartbeats carry no
-// entries, so no log replication, no commit index, no client routing yet.
+// Raft leader election, heartbeats and log replication (Raft paper, Figure
+// 2), minus commitment: entries are copied to followers' logs, but there is
+// no commit index, nothing is applied to the state machine, and client
+// writes aren't routed through Raft yet. leader_commit is always 0.
 //
-// Each heartbeat is a probe. The leader keeps nextIndex/matchIndex per
-// follower and sends prev_log_index = nextIndex - 1 with the term its own log
-// has there; a follower succeeds only if its log has that entry with that
-// term. On failure the leader steps nextIndex back by one, so successive
+// Each heartbeat is a probe plus a batch. The leader keeps nextIndex and
+// matchIndex per follower and sends prev_log_index = nextIndex - 1 with the
+// term its own log has there, followed by its entries from nextIndex on (at
+// most kMaxEntriesPerAppend / kMaxAppendBytes). A follower succeeds only if
+// its log has that prev entry with that term; it then stores the entries,
+// deleting its own from the first term conflict on, and fsyncs before
+// replying. On failure the leader steps nextIndex back by one, so successive
 // heartbeats walk back to the last index the two logs agree on.
 //
 // Everything runs on the caller's io_context: the RPC handlers, the RPC
@@ -30,14 +34,24 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <vector>
 #include "raft_messages.h"
 #include "raft_state.h"
+#include "rpc_frame.h"
 #include "../network/peer_transport.h"
 
 constexpr std::chrono::milliseconds kElectionTimeoutMin{150};
 constexpr std::chrono::milliseconds kElectionTimeoutMax{300};
 constexpr std::chrono::milliseconds kHeartbeatInterval{50};  // well under kElectionTimeoutMin
+
+// Per-AppendEntries batch bounds. A very-behind follower catches up over
+// several heartbeats. The byte bound counts log frames (8-byte header plus
+// payload), never less than an entry's encoding inside the RPC, so a batch
+// stays far below the RPC frame cap. One entry is always sent, whatever its size.
+constexpr std::size_t kMaxEntriesPerAppend = 64;
+constexpr std::size_t kMaxAppendBytes = 1024 * 1024;
+static_assert(kMaxAppendBytes + 4096 <= kMaxRpcPayloadSize, "a full batch must fit in one RPC frame");
 
 enum class raft_role { follower, candidate, leader };
 const char* to_string(raft_role role);
@@ -50,26 +64,38 @@ struct log_position
     std::uint64_t last_term = 0;
 };
 
-// Read-only view of the local log, as Raft needs it.
-class RaftLogView
+// The local log, as Raft needs it. Writes must be durable when they return.
+class RaftLog
 {
 public:
-    virtual ~RaftLogView() = default;
+    virtual ~RaftLog() = default;
     virtual log_position last() const = 0;
     // Term of the entry at `index`: 0 for index 0, nullopt past the end.
     virtual std::optional<std::uint64_t> term_at(std::uint64_t index) const = 0;
+    // Entries from `from` on, at most `max_count`, and past the first at
+    // most `max_bytes` of log frames. Empty if `from` is past the end.
+    virtual std::vector<log_entry> entries(std::uint64_t from, std::size_t max_count,
+                                           std::size_t max_bytes) const = 0;
+    // Deletes entry `index` and everything after it.
+    virtual void truncate_from(std::uint64_t index) = 0;
+    // Appends entries whose first index is last().last_index + 1.
+    virtual void append(std::span<const log_entry> entries) = 0;
 };
 
-// RaftLogView over the node's PersistentLog. `log` must outlive the view.
-class PersistentLogView final : public RaftLogView
+// RaftLog over the node's PersistentLog. `log` must outlive this.
+class PersistentRaftLog final : public RaftLog
 {
 public:
-    explicit PersistentLogView(const PersistentLog& log) : log_(log) {}
+    explicit PersistentRaftLog(PersistentLog& log) : log_(log) {}
     log_position last() const override;
     std::optional<std::uint64_t> term_at(std::uint64_t index) const override;
+    std::vector<log_entry> entries(std::uint64_t from, std::size_t max_count,
+                                   std::size_t max_bytes) const override;
+    void truncate_from(std::uint64_t index) override;
+    void append(std::span<const log_entry> entries) override;
 
 private:
-    const PersistentLog& log_;
+    PersistentLog& log_;
 };
 
 // A leader's view of one follower (Figure 2, "volatile state on leaders").
@@ -111,7 +137,7 @@ public:
     // majorities is peers.size() + 1. `client` and `log` must outlive the node.
     // Throws raft_state_error if options.state can't be loaded.
     RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peers, PeerClient& client,
-             const RaftLogView& log, raft_options options = {});
+             RaftLog& log, raft_options options = {});
     ~RaftNode();
     RaftNode(const RaftNode&) = delete;
     RaftNode& operator=(const RaftNode&) = delete;
@@ -141,7 +167,9 @@ private:
     void become_leader();
     void send_heartbeats();
     void on_heartbeat_reply(node_id peer, std::uint64_t sent_term, std::uint64_t prev_log_index,
-                            const rpc_result<append_entries_response>& reply);
+                            std::size_t sent_entries, const rpc_result<append_entries_response>& reply);
+    // Follower side of AppendEntries once the consistency check has passed.
+    void store_entries(const append_entries_request& req);
     void step_down(std::uint64_t new_term, const char* why, node_id from);
     // Durably records term/vote, then updates the in-memory copy.
     void persist(std::uint64_t term, node_id voted_for);
@@ -151,7 +179,7 @@ private:
     node_id self_;
     std::vector<node_id> peers_;
     PeerClient& client_;
-    const RaftLogView& log_;
+    RaftLog& log_;
     raft_options options_;
     std::mt19937_64 rng_;
 

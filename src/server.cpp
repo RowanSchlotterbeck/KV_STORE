@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
     // Destruction order matters: peer_server (holds raft's handlers) goes
     // first, then raft, then the client raft sends through, then its state file.
     std::optional<RaftStateFile> raft_state;
-    const PersistentLogView raft_log(engine_log());
+    PersistentRaftLog raft_log(engine_log());
     std::optional<ConnectPerRpcClient> peer_client;
     std::optional<RaftNode> raft;
     std::optional<PeerServer> peer_server;

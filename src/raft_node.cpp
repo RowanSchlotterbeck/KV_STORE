@@ -17,16 +17,29 @@ const char* to_string(raft_role role) {
     return "?";
 }
 
-log_position PersistentLogView::last() const {
+log_position PersistentRaftLog::last() const {
     return {log_.last_index(), log_.last_term()};
 }
 
-std::optional<std::uint64_t> PersistentLogView::term_at(std::uint64_t index) const {
+std::optional<std::uint64_t> PersistentRaftLog::term_at(std::uint64_t index) const {
     return log_.term_at(index);
 }
 
+std::vector<log_entry> PersistentRaftLog::entries(std::uint64_t from, std::size_t max_count,
+                                                  std::size_t max_bytes) const {
+    return log_.read_entries(from, max_count, max_bytes);
+}
+
+void PersistentRaftLog::truncate_from(std::uint64_t index) {
+    log_.truncate_from(index);
+}
+
+void PersistentRaftLog::append(std::span<const log_entry> entries) {
+    log_.append_entries(entries);
+}
+
 RaftNode::RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peers, PeerClient& client,
-                   const RaftLogView& log, raft_options options)
+                   RaftLog& log, raft_options options)
     : self_(self), peers_(std::move(peers)), client_(client),
       log_(log), options_(std::move(options)),
       rng_(options_.seed != 0 ? options_.seed : std::random_device{}()),
@@ -176,7 +189,8 @@ void RaftNode::become_leader() {
 void RaftNode::send_heartbeats() {
     if (role_ != raft_role::leader) { return; }
     for (const node_id peer : peers_) {
-        // Per-follower probe at nextIndex - 1. No entries yet, and leader_commit stays 0.
+        // Per-follower probe at nextIndex - 1, plus our entries from nextIndex
+        // on (none if the follower is caught up). leader_commit stays 0.
         peer_progress& p = progress_[peer];
         std::optional<std::uint64_t> prev_term = log_.term_at(p.next_index - 1);
         if (!prev_term) {
@@ -185,12 +199,18 @@ void RaftNode::send_heartbeats() {
             p.next_index = log_.last().last_index + 1;
             prev_term = log_.term_at(p.next_index - 1);
         }
-        const append_entries_request req{current_term_, self_, p.next_index - 1, prev_term.value_or(0), {}, 0};
+        append_entries_request req{current_term_, self_, p.next_index - 1, prev_term.value_or(0), {}, 0};
+        try {
+            req.entries = log_.entries(p.next_index, kMaxEntriesPerAppend, kMaxAppendBytes);
+        } catch (const wal_error& e) {
+            // Can't read our own log: still assert leadership, just without entries.
+            log("cannot read entries from ", p.next_index, " for node ", peer, ": ", e.what());
+        }
         client_.send_append_entries(peer, req,
-            [this, alive = std::weak_ptr<char>(alive_), peer, term = current_term_, prev = req.prev_log_index](
-                rpc_result<append_entries_response> reply) {
+            [this, alive = std::weak_ptr<char>(alive_), peer, term = current_term_, prev = req.prev_log_index,
+             count = req.entries.size()](rpc_result<append_entries_response> reply) {
                 if (alive.expired()) { return; }
-                on_heartbeat_reply(peer, term, prev, reply);
+                on_heartbeat_reply(peer, term, prev, count, reply);
             });
     }
 
@@ -203,7 +223,7 @@ void RaftNode::send_heartbeats() {
 }
 
 void RaftNode::on_heartbeat_reply(node_id peer, std::uint64_t sent_term, std::uint64_t prev_log_index,
-                                  const rpc_result<append_entries_response>& reply) {
+                                  std::size_t sent_entries, const rpc_result<append_entries_response>& reply) {
     if (!reply.ok()) { return; }  // unreachable peer: the next heartbeat retries
     if (reply.response.term > current_term_) {
         step_down(reply.response.term, "AppendEntries reply", peer);
@@ -213,8 +233,14 @@ void RaftNode::on_heartbeat_reply(node_id peer, std::uint64_t sent_term, std::ui
     if (role_ != raft_role::leader || current_term_ != sent_term) { return; }
     peer_progress& p = progress_[peer];
     if (reply.response.success) {
-        // Entries are empty, so prev_log_index is exactly the point known to match.
-        p.match_index = std::max(p.match_index, prev_log_index);
+        // The follower now matches us through the last entry that request
+        // carried. matchIndex never goes back, so a late or duplicate success
+        // for an earlier batch can't undo a later one.
+        const std::uint64_t matched = prev_log_index + sent_entries;
+        if (matched > p.match_index) {
+            log("matchIndex[", peer, "] ", p.match_index, " -> ", matched);
+            p.match_index = matched;
+        }
         p.next_index = p.match_index + 1;
         return;
     }
@@ -324,9 +350,10 @@ append_entries_response RaftNode::handle_append_entries(const append_entries_req
     // timer resets either way; success reports only the consistency check.
     reset_election_timer();
 
-    // prev_log_index 0 is the empty prefix every log shares: always a match.
-    if (req.prev_log_index == 0) { return {current_term_, true}; }
-    const std::optional<std::uint64_t> mine = log_.term_at(req.prev_log_index);
+    // prev_log_index 0 is the empty prefix every log shares: always a match
+    // (whatever prev_log_term says), and the entries are still stored below.
+    const std::optional<std::uint64_t> mine =
+        req.prev_log_index == 0 ? std::optional<std::uint64_t>(req.prev_log_term) : log_.term_at(req.prev_log_index);
     if (!mine) {
         log("rejected AppendEntries from node ", req.leader_id, ": no entry at prev_log_index ",
             req.prev_log_index, " (log ends at ", log_.last().last_index, ")");
@@ -337,5 +364,44 @@ append_entries_response RaftNode::handle_append_entries(const append_entries_req
             req.prev_log_index, " has term ", *mine, ", leader expects ", req.prev_log_term);
         return {current_term_, false};
     }
+    for (std::size_t k = 0; k < req.entries.size(); ++k) {
+        if (req.entries[k].index != req.prev_log_index + 1 + k) {
+            log("rejected AppendEntries from node ", req.leader_id, ": entry ", k, " has index ",
+                req.entries[k].index, ", expected ", req.prev_log_index + 1 + k);
+            return {current_term_, false};
+        }
+    }
+    store_entries(req);  // on disk before success is returned
     return {current_term_, true};
+}
+
+void RaftNode::store_entries(const append_entries_request& req) {
+    const std::span<const log_entry> incoming(req.entries);
+    try {
+        // Skip what we already have with the same term (a retransmission must
+        // never delete good entries); at the first term conflict, delete ours
+        // from there on; append everything after that point.
+        std::size_t k = 0;
+        for (; k < incoming.size(); ++k) {
+            const std::optional<std::uint64_t> mine = log_.term_at(incoming[k].index);
+            if (!mine) { break; }
+            if (*mine != incoming[k].term) {
+                log("conflict at index ", incoming[k].index, " (my term ", *mine, ", leader's ",
+                    incoming[k].term, "): truncating my log from ", incoming[k].index,
+                    " (was ", log_.last().last_index, " entries)");
+                log_.truncate_from(incoming[k].index);
+                break;
+            }
+        }
+        if (k == incoming.size()) { return; }
+        log_.append(incoming.subspan(k));
+        log("appended entries ", incoming[k].index, "..", incoming.back().index, " from node ",
+            req.leader_id, " (last index now ", log_.last().last_index, ")");
+    } catch (const wal_error& e) {
+        // Replying success here would acknowledge entries that may not be on
+        // disk; replying failure would walk the leader back for no reason.
+        std::cerr << "[raft node " << self_ << "] FATAL: cannot store entries from node "
+                  << req.leader_id << ": " << e.what() << "\n";
+        std::abort();
+    }
 }

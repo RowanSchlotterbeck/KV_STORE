@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,8 +67,28 @@ public:
 
     // Durably appends `cmd` as the next entry (term 0 until Raft assigns terms)
     // and returns its index. Throws wal_error on I/O failure; after a failure
-    // the log refuses further appends until it is reopened.
+    // the log refuses further writes until it is reopened.
     std::uint64_t append(const command& cmd);
+
+    // Durably appends entries that already carry their index and term (from a
+    // Raft leader): one write and one fsync for the whole batch. The first
+    // index must be last_index() + 1 and the rest contiguous, or wal_error is
+    // thrown before anything is written. I/O failures as for append().
+    void append_entries(std::span<const log_entry> entries);
+    void append_entry(const log_entry& entry) { append_entries({&entry, 1}); }
+
+    // Durably deletes entry `index` and everything after it, by truncating the
+    // file at that entry's start, so it ends on a clean frame boundary. No-op
+    // if the log is already shorter. Index 0 is invalid. I/O failures as above.
+    void truncate_from(std::uint64_t index);
+
+    // Reads entries from `from` on: at most `max_count` of them and, past the
+    // first, at most `max_bytes` of log frames in total (the first is always
+    // returned, whatever its size). Empty if `from` is past the end. Each
+    // frame's checksum is verified again; throws wal_error on read failure or
+    // corruption.
+    std::vector<log_entry> read_entries(std::uint64_t from, std::size_t max_count,
+                                        std::size_t max_bytes) const;
 
     std::uint64_t last_index() const { return last_index_; }
     // Term of the last entry (0 for an empty log). Raft's up-to-date check uses this.
@@ -80,14 +101,15 @@ public:
     std::uint64_t recovered_tail_bytes() const { return recovered_tail_bytes_; }
 
 private:
-    void append_entry(const log_entry& entry);
+    void check_writable(const char* op) const;
 
     int fd_ = -1;
     std::string path_;
     std::uint64_t last_index_ = 0;
     std::uint64_t last_term_ = 0;
     std::uint64_t end_offset_ = 0;  // file offset just past the last good entry
-    std::vector<std::uint64_t> terms_;  // terms_[i - 1] is the term of entry i
+    std::vector<std::uint64_t> terms_;    // terms_[i - 1] is the term of entry i
+    std::vector<std::uint64_t> offsets_;  // offsets_[i - 1] is the file offset where entry i's frame starts
     std::uint64_t recovered_tail_bytes_ = 0;
     bool replayed_ = false;
     bool failed_ = false;

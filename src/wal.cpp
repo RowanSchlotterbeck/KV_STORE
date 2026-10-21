@@ -74,6 +74,7 @@ void PersistentLog::open(const std::string& path) {
     last_term_ = 0;
     end_offset_ = 0;
     terms_.clear();
+    offsets_.clear();
     recovered_tail_bytes_ = 0;
     replayed_ = false;
     failed_ = false;
@@ -117,6 +118,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
     std::uint64_t last = 0;
     std::uint64_t last_term = 0;
     std::vector<std::uint64_t> terms;
+    std::vector<std::uint64_t> offsets;
     const auto corrupt = [&](const std::string& why) {
         return wal_error("corrupt log " + path_ + ": " + why + " in entry at byte offset "
                          + std::to_string(offset) + " of " + std::to_string(size)
@@ -165,6 +167,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
         last = entry.index;
         last_term = entry.term;
         terms.push_back(entry.term);
+        offsets.push_back(offset);
         offset += kHeaderSize + len;
     }
 
@@ -180,6 +183,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
     last_term_ = last_term;
     end_offset_ = offset;
     terms_ = std::move(terms);
+    offsets_ = std::move(offsets);
     replayed_ = true;
     return last_index_;
 }
@@ -205,14 +209,32 @@ std::uint64_t PersistentLog::append(const command& cmd) {
     return entry.index;
 }
 
-void PersistentLog::append_entry(const log_entry& entry) {
-    if (!is_open()) { throw wal_error("append: log not open"); }
-    if (!replayed_) { throw wal_error("append: replay() must run before append()"); }
-    if (failed_) { throw wal_error("append: log disabled after an earlier I/O error; restart to recover"); }
+void PersistentLog::check_writable(const char* op) const {
+    const std::string what(op);
+    if (!is_open()) { throw wal_error(what + ": log not open"); }
+    if (!replayed_) { throw wal_error(what + ": replay() must run before append()"); }
+    if (failed_) { throw wal_error(what + ": log disabled after an earlier I/O error; restart to recover"); }
+}
 
-    const std::string frame = encode_frame(entry);
+void PersistentLog::append_entries(std::span<const log_entry> entries) {
+    check_writable("append");
+    if (entries.empty()) { return; }
 
-    if (!write_all(fd_, frame.data(), frame.size()) || !full_sync(fd_)) {
+    std::string frames;
+    std::vector<std::uint64_t> frame_offsets;
+    frame_offsets.reserve(entries.size());
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const std::uint64_t expected = last_index_ + 1 + i;
+        if (entries[i].index != expected) {
+            throw wal_error("append: expected index " + std::to_string(expected) + " but got "
+                            + std::to_string(entries[i].index) + " (log " + path_ + " ends at "
+                            + std::to_string(last_index_) + ")");
+        }
+        frame_offsets.push_back(end_offset_ + frames.size());
+        frames += encode_frame(entries[i]);
+    }
+
+    if (!write_all(fd_, frames.data(), frames.size()) || !full_sync(fd_)) {
         // The file may now hold a partial or unsynced frame. Try to cut it back,
         // but stop accepting appends either way: after a failed fsync the page
         // cache can't be trusted, and replay() will repair any torn tail.
@@ -222,10 +244,82 @@ void PersistentLog::append_entry(const log_entry& entry) {
         throw wal_error(msg);
     }
 
-    end_offset_ += frame.size();
-    last_index_ = entry.index;
-    last_term_ = entry.term;
-    terms_.push_back(entry.term);
+    end_offset_ += frames.size();
+    last_index_ = entries.back().index;
+    last_term_ = entries.back().term;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        terms_.push_back(entries[i].term);
+        offsets_.push_back(frame_offsets[i]);
+    }
+}
+
+void PersistentLog::truncate_from(std::uint64_t index) {
+    check_writable("truncate");
+    if (index == 0) { throw wal_error("truncate: index 0 is not an entry"); }
+    if (index > last_index_) { return; }
+
+    // Same mechanism as torn-tail recovery: cut the file at a frame boundary, then sync.
+    const std::uint64_t cut = offsets_[index - 1];
+    if (::ftruncate(fd_, static_cast<off_t>(cut)) != 0 || !full_sync(fd_)) {
+        const std::string msg = errno_message("truncate", path_);
+        failed_ = true;
+        throw wal_error(msg);
+    }
+
+    terms_.resize(index - 1);
+    offsets_.resize(index - 1);
+    end_offset_ = cut;
+    last_index_ = index - 1;
+    last_term_ = terms_.empty() ? 0 : terms_.back();
+}
+
+std::vector<log_entry> PersistentLog::read_entries(std::uint64_t from, std::size_t max_count,
+                                                   std::size_t max_bytes) const {
+    std::vector<log_entry> out;
+    if (!is_open() || from == 0 || from > last_index_ || max_count == 0) { return out; }
+
+    // Frame i spans [offsets_[i-1], start of frame i+1 or end_offset_).
+    const auto frame_end = [&](std::uint64_t i) { return i < last_index_ ? offsets_[i] : end_offset_; };
+    std::uint64_t last = from;
+    std::uint64_t bytes = frame_end(from) - offsets_[from - 1];
+    while (last < last_index_ && last - from + 1 < max_count) {
+        const std::uint64_t next = frame_end(last + 1) - offsets_[last];
+        if (bytes + next > max_bytes) { break; }
+        bytes += next;
+        ++last;
+    }
+
+    std::string buf(static_cast<std::size_t>(bytes), '\0');
+    const std::uint64_t start = offsets_[from - 1];
+    std::size_t got = 0;
+    while (got < buf.size()) {
+        const ssize_t n = ::pread(fd_, buf.data() + got, buf.size() - got, static_cast<off_t>(start + got));
+        if (n < 0) {
+            if (errno == EINTR) { continue; }
+            throw wal_error(errno_message("read", path_));
+        }
+        if (n == 0) { throw wal_error("read " + path_ + ": file shorter than its replayed entries"); }
+        got += static_cast<std::size_t>(n);
+    }
+
+    out.reserve(static_cast<std::size_t>(last - from + 1));
+    std::size_t pos = 0;
+    for (std::uint64_t i = from; i <= last; ++i) {
+        const std::uint32_t len = load_u32_le(buf.data() + pos);
+        const std::uint32_t stored_crc = load_u32_le(buf.data() + pos + 4);
+        const auto bad = [&](const std::string& why) {
+            return wal_error("corrupt log " + path_ + ": " + why + " in entry " + std::to_string(i)
+                             + " at byte offset " + std::to_string(offsets_[i - 1]));
+        };
+        if (kHeaderSize + len > buf.size() - pos) { throw bad("length runs past its frame"); }
+        const std::string_view payload(buf.data() + pos + kHeaderSize, len);
+        if (crc32c(payload) != stored_crc) { throw bad("checksum mismatch"); }
+        log_entry entry;
+        if (!decode_entry_payload(payload, entry) || entry.index != i) { throw bad("undecodable payload"); }
+        out.push_back(std::move(entry));
+        pos += kHeaderSize + len;
+    }
+    return out;
 }
 
 std::optional<std::uint64_t> PersistentLog::term_at(std::uint64_t index) const {

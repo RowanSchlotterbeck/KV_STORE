@@ -166,9 +166,14 @@ round trip, not the engine, is the bottleneck for real client traffic.
 
 ## Known limitations
 
-- Cluster mode elects a leader but does not replicate: each node still
-  applies client writes to its own log, wherever they arrive.
-  Every write is fsynced individually (no batching), so
+- Cluster mode elects a leader and copies the leader's log entries to
+  followers (repairing divergent tails), but nothing is committed or
+  applied through Raft yet. Client writes still go straight into the log
+  of whichever node receives them, as term-0 entries, and a node replays
+  (applies) every entry in its log at startup, including replicated ones.
+  A follower far behind catches up one heartbeat per missing index before
+  entries flow.
+- Every write is fsynced individually (no batching), so
   write throughput is bounded by disk sync latency.
 - No authentication, TLS, or multi-database support.
 - The server handles one line per read/write cycle per connection with

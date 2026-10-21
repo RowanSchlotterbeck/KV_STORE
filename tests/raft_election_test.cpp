@@ -93,10 +93,21 @@ public:
     std::vector<append_call> appends;
 };
 
-// A log as a list of terms: terms[i - 1] is the term of entry i.
-struct FakeLog final : RaftLogView
+// The entry every fake or seeded test log holds at `index` in `term`. The
+// command depends on both, so entries from different terms really differ.
+static log_entry fake_entry(std::uint64_t index, std::uint64_t term) {
+    return {index, term, command{"PUT", "k" + std::to_string(index),
+                                 "v" + std::to_string(index) + "t" + std::to_string(term)}};
+}
+
+// An in-memory log as a list of terms: terms[i - 1] is the term of entry i,
+// whose contents are fake_entry(i, terms[i - 1]). Ignores the byte cap
+// (fake entries are tiny); the PersistentLog tests cover it.
+struct FakeLog final : RaftLog
 {
     std::vector<std::uint64_t> terms;
+    std::vector<std::vector<log_entry>> appended;  // every append() batch, in order
+    std::vector<std::uint64_t> truncations;        // every truncate_from() index, in order
 
     log_position last() const override {
         return terms.empty() ? log_position{} : log_position{terms.size(), terms.back()};
@@ -106,9 +117,51 @@ struct FakeLog final : RaftLogView
         if (index > terms.size()) { return std::nullopt; }
         return terms[index - 1];
     }
+    std::vector<log_entry> entries(std::uint64_t from, std::size_t max_count, std::size_t) const override {
+        std::vector<log_entry> out;
+        for (std::uint64_t i = from; i >= 1 && i <= terms.size() && out.size() < max_count; ++i) {
+            out.push_back(fake_entry(i, terms[i - 1]));
+        }
+        return out;
+    }
+    void truncate_from(std::uint64_t index) override {
+        truncations.push_back(index);
+        if (index >= 1 && index <= terms.size()) { terms.resize(index - 1); }
+    }
+    void append(std::span<const log_entry> batch) override {
+        appended.emplace_back(batch.begin(), batch.end());
+        for (const auto& e : batch) {
+            CHECK(e.index == terms.size() + 1);
+            terms.push_back(e.term);
+        }
+    }
     // `index` entries, all in `term`.
     void set_last(std::uint64_t index, std::uint64_t term) { terms.assign(index, term); }
 };
+
+// Writes a log file whose entry i is fake_entry(i, terms[i - 1]).
+static void write_log_file(const std::filesystem::path& path, const std::vector<std::uint64_t>& terms) {
+    std::filesystem::create_directories(path.parent_path());
+    std::string frames;
+    for (std::size_t i = 0; i < terms.size(); ++i) { frames += PersistentLog::encode_frame(fake_entry(i + 1, terms[i])); }
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    CHECK(f != nullptr);
+    if (f) {
+        std::fwrite(frames.data(), 1, frames.size(), f);
+        std::fclose(f);
+    }
+}
+
+static std::string read_file(const std::filesystem::path& path) {
+    std::string out;
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        char buf[65536];
+        std::size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) { out.append(buf, n); }
+        std::fclose(f);
+    }
+    return out;
+}
 
 static rpc_result<request_vote_response> vote_reply(std::uint64_t term, bool granted) {
     return {rpc_error::none, {term, granted}};
@@ -168,7 +221,7 @@ static void test_majority_math() {
     std::puts("test_majority_math");
     asio::io_context io;
     FakeClient c;
-    const FakeLog pos;
+    FakeLog pos;
     const std::vector<std::vector<node_id>> clusters = {{}, {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6, 7}};
     const std::vector<std::size_t> expect = {1, 2, 2, 3, 3, 4};  // N = 1,2,3,4,5,7
     for (std::size_t i = 0; i < clusters.size(); ++i) {
@@ -567,6 +620,43 @@ static void test_leader_progress() {
     CHECK(h.node.progress()[2].next_index == 4 && h.node.progress()[2].match_index == 3);
 }
 
+// Success advances matchIndex by exactly the entries the answered request
+// carried; a late success for an older, shorter batch can't move it back.
+static void test_success_advances_by_count() {
+    std::puts("test_success_advances_by_count");
+    Harness h(1, {2, 3}, quiet(50ms, 50ms, 20ms));
+    h.log.terms = {1, 1, 1, 1, 1};
+    make_leader(h);
+    // Copies: `appends` reallocates as more heartbeats go out.
+    const auto next_to_2 = [&](std::size_t& seen) {
+        run_until(h.io, [&] { return !appends_to(h.client, 2, seen).empty(); }, 1000ms);
+        auto* call = appends_to(h.client, 2, seen).front();
+        seen = static_cast<std::size_t>(call - h.client.appends.data()) + 1;
+        return FakeClient::append_call{call->peer, call->req, call->cb};
+    };
+    std::size_t seen = 0;
+    const auto a = next_to_2(seen);   // prev 5, no entries
+    CHECK(a.req.prev_log_index == 5 && a.req.entries.empty());
+    a.cb(append_reply(1, false));     // next 6 -> 5
+    const auto b = next_to_2(seen);   // prev 4 + [5]
+    CHECK(b.req.prev_log_index == 4 && b.req.entries.size() == 1 && b.req.entries[0].index == 5);
+    b.cb(append_reply(1, false));     // next 5 -> 4
+    const auto c = next_to_2(seen);   // prev 3 + [4, 5]
+    CHECK(c.req.prev_log_index == 3 && c.req.entries.size() == 2);
+    CHECK(c.req.entries[0].index == 4 && c.req.entries[0].term == 1 && c.req.entries[0].cmd.key == "k4");
+    c.cb(append_reply(1, true));      // match = 3 + 2
+    auto p = h.node.progress()[2];
+    CHECK(p.match_index == 5 && p.next_index == 6);
+    // A duplicate of an earlier, shorter batch succeeding late: no change.
+    b.cb(append_reply(1, true));      // 4 + 1 = 5: same
+    a.cb(append_reply(1, true));      // 5 + 0 = 5: same
+    p = h.node.progress()[2];
+    CHECK(p.match_index == 5 && p.next_index == 6);
+    // Caught up: the next heartbeat carries no entries.
+    const auto d = next_to_2(seen);
+    CHECK(d.req.prev_log_index == 5 && d.req.prev_log_term == 1 && d.req.entries.empty());
+}
+
 // nextIndex never goes below 1, and index 0 always matches, so the walk ends.
 static void test_next_index_floor() {
     std::puts("test_next_index_floor");
@@ -618,100 +708,322 @@ static void test_reply_with_higher_term() {
     CHECK(h.node.role() == raft_role::leader && h.node.progress()[3].next_index == 3);
 }
 
-// Writes a PersistentLog whose entry i has term terms[i - 1], and opens it.
+// Writes a log file of fake_entry(i, terms[i - 1]) and opens it.
 static void build_log(PersistentLog& log, const std::filesystem::path& path,
                       const std::vector<std::uint64_t>& terms) {
-    std::filesystem::create_directories(path.parent_path());
-    std::string frames;
-    for (std::size_t i = 0; i < terms.size(); ++i) {
-        frames += PersistentLog::encode_frame(
-            log_entry{i + 1, terms[i], command{"PUT", "k" + std::to_string(i + 1), "v"}});
-    }
-    std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (f) {
-        std::fwrite(frames.data(), 1, frames.size(), f);
-        std::fclose(f);
-    }
+    write_log_file(path, terms);
     log.open(path.string());
     StateMachine sm;
     CHECK(log.replay(sm) == terms.size());
 }
 
-// The backward walk, on real PersistentLogs that diverge after index 4:
+static std::vector<std::uint64_t> terms_of(const PersistentLog& log) {
+    std::vector<std::uint64_t> out;
+    for (std::uint64_t i = 1; i <= log.last_index(); ++i) { out.push_back(*log.term_at(i)); }
+    return out;
+}
+
+// ---- follower side: storing entries ----
+
+// One follower on a real PersistentLog, fed AppendEntries by hand.
+struct DiskFollower
+{
+    std::filesystem::path path;
+    PersistentLog disk;
+    std::unique_ptr<PersistentRaftLog> log;
+    asio::io_context io;
+    FakeClient client;
+    std::unique_ptr<RaftNode> node;
+
+    DiskFollower(const std::filesystem::path& p, const std::vector<std::uint64_t>& terms) : path(p) {
+        build_log(disk, path, terms);
+        log = std::make_unique<PersistentRaftLog>(disk);
+        node = std::make_unique<RaftNode>(io, 2, std::vector<node_id>{1, 3}, client, *log, quiet(10s, 10s));
+        node->start();
+    }
+};
+
+static append_entries_request with_entries(std::uint64_t term, std::uint64_t prev_index, std::uint64_t prev_term,
+                                           const std::vector<std::pair<std::uint64_t, std::uint64_t>>& index_terms) {
+    append_entries_request req{term, 1, prev_index, prev_term, {}, 0};
+    for (const auto& [i, t] : index_terms) { req.entries.push_back(fake_entry(i, t)); }
+    return req;
+}
+
+static void test_follower_stores_entries() {
+    std::puts("test_follower_stores_entries");
+    TempDir dir;
+    {
+        // Missing entries: appended after the matching prev entry.
+        DiskFollower f(dir.path / "append" / "kv.log", {1, 1});
+        const auto r = f.node->handle_append_entries(with_entries(3, 2, 1, {{3, 2}, {4, 2}, {5, 3}}));
+        CHECK(r.success && r.term == 3);
+        CHECK(terms_of(f.disk) == std::vector<std::uint64_t>({1, 1, 2, 2, 3}));
+        write_log_file(dir.path / "append" / "want.log", {1, 1, 2, 2, 3});
+        CHECK(read_file(f.path) == read_file(dir.path / "append" / "want.log"));  // byte-identical
+        // Nothing reached a state machine or commit index: this chunk only stores.
+        CHECK(f.node->role() == raft_role::follower && f.node->status().leader_id == 1);
+    }
+    {
+        // An empty log takes entries from index 1 (prev_log_index 0). A
+        // success here that stored nothing would be a false acknowledgement.
+        DiskFollower f(dir.path / "empty" / "kv.log", {});
+        CHECK(f.node->handle_append_entries(with_entries(2, 0, 0, {{1, 1}, {2, 2}})).success);
+        CHECK(terms_of(f.disk) == std::vector<std::uint64_t>({1, 2}));
+        // And a non-empty one whose very first entry conflicts is replaced whole.
+        DiskFollower g(dir.path / "first" / "kv.log", {1, 1});
+        CHECK(g.node->handle_append_entries(with_entries(3, 0, 0, {{1, 3}})).success);
+        CHECK(terms_of(g.disk) == std::vector<std::uint64_t>({3}));
+    }
+    {
+        // Divergent tail: entries 3..5 are in term 2, the leader has term 3 from
+        // index 3. Delete 3..5, store the leader's; 1..2 untouched.
+        DiskFollower f(dir.path / "conflict" / "kv.log", {1, 1, 2, 2, 2});
+        const std::string before = read_file(f.path);
+        const std::size_t prefix = PersistentLog::encode_frame(fake_entry(1, 1)).size()
+                                 + PersistentLog::encode_frame(fake_entry(2, 1)).size();
+        const auto r = f.node->handle_append_entries(with_entries(3, 2, 1, {{3, 3}, {4, 3}}));
+        CHECK(r.success);
+        CHECK(terms_of(f.disk) == std::vector<std::uint64_t>({1, 1, 3, 3}));
+        const std::string after = read_file(f.path);
+        CHECK(after.compare(0, prefix, before, 0, prefix) == 0);
+        write_log_file(dir.path / "conflict" / "want.log", {1, 1, 3, 3});
+        CHECK(after == read_file(dir.path / "conflict" / "want.log"));
+    }
+    {
+        // A conflict found partway through the batch: 3 matches, 4 conflicts.
+        DiskFollower f(dir.path / "midbatch" / "kv.log", {1, 1, 2, 2, 2, 2});
+        CHECK(f.node->handle_append_entries(with_entries(4, 2, 1, {{3, 2}, {4, 4}, {5, 4}})).success);
+        CHECK(terms_of(f.disk) == std::vector<std::uint64_t>({1, 1, 2, 4, 4}));
+    }
+    {
+        // Idempotency: the same request again changes nothing, still succeeds.
+        DiskFollower f(dir.path / "idem" / "kv.log", {1, 1});
+        const auto req = with_entries(3, 1, 1, {{2, 1}, {3, 3}, {4, 3}});
+        CHECK(f.node->handle_append_entries(req).success);
+        const std::string once = read_file(f.path);
+        CHECK(f.node->handle_append_entries(req).success);
+        CHECK(read_file(f.path) == once);
+        // An older, shorter request (a retransmission overtaken by a later
+        // one) must not delete the entries after it: they match, so no conflict.
+        CHECK(f.node->handle_append_entries(with_entries(3, 1, 1, {{2, 1}})).success);
+        CHECK(f.node->handle_append_entries(with_entries(3, 0, 0, {})).success);
+        CHECK(read_file(f.path) == once);
+        CHECK(terms_of(f.disk) == std::vector<std::uint64_t>({1, 1, 3, 3}));
+    }
+    {
+        // A failed consistency check stores nothing, even with entries attached.
+        DiskFollower f(dir.path / "nocheck" / "kv.log", {1, 1});
+        const std::string before = read_file(f.path);
+        CHECK(!f.node->handle_append_entries(with_entries(3, 3, 1, {{4, 3}})).success);  // no entry 3
+        CHECK(!f.node->handle_append_entries(with_entries(3, 2, 2, {{3, 3}})).success);  // entry 2 is term 1
+        // Entries whose indices don't follow prev_log_index are malformed: refused.
+        CHECK(!f.node->handle_append_entries(with_entries(3, 2, 1, {{4, 3}})).success);
+        CHECK(!f.node->handle_append_entries(with_entries(3, 2, 1, {{3, 3}, {5, 3}})).success);
+        CHECK(read_file(f.path) == before);
+    }
+    {
+        // Durability: what the follower acknowledged survives a crash.
+        const auto path = dir.path / "crash" / "kv.log";
+        std::string acked;
+        {
+            DiskFollower f(path, {1});
+            CHECK(f.node->handle_append_entries(with_entries(2, 1, 1, {{2, 2}, {3, 2}})).success);
+            acked = read_file(path);
+        }  // crash: node and log gone without any shutdown step
+        PersistentLog reopened;
+        reopened.open(path.string());
+        StateMachine sm;
+        CHECK(reopened.replay(sm) == 3);
+        CHECK(terms_of(reopened) == std::vector<std::uint64_t>({1, 2, 2}));
+        CHECK(reopened.recovered_tail_bytes() == 0 && read_file(path) == acked);
+    }
+}
+
+// ---- leader side: sending entries ----
+
+// A leader and a follower on real logs, the leader driven by its own timers
+// and every AppendEntries to node 2 delivered to the follower by hand.
+struct DiskPair
+{
+    PersistentLog leader_disk;
+    std::unique_ptr<PersistentRaftLog> leader_log;
+    std::unique_ptr<RaftStateFile> leader_state;
+    asio::io_context leader_io;
+    FakeClient leader_client;
+    std::unique_ptr<RaftNode> leader;
+    std::unique_ptr<DiskFollower> follower;
+    std::size_t seen = 0;
+
+    struct round { append_entries_request req; append_entries_response resp; peer_progress after; std::uint64_t follower_last; };
+    std::vector<round> rounds;
+
+    DiskPair(const std::filesystem::path& dir, const std::vector<std::uint64_t>& leader_terms,
+             const std::vector<std::uint64_t>& follower_terms, std::uint64_t start_term,
+             std::chrono::milliseconds heartbeat = 20ms) {
+        build_log(leader_disk, dir / "leader" / "kv.log", leader_terms);
+        leader_log = std::make_unique<PersistentRaftLog>(leader_disk);
+        // Resume past every term in either log, as a real leader would be.
+        leader_state = std::make_unique<RaftStateFile>((dir / "leader" / "kv.log.raftstate").string(), 1);
+        leader_state->save({start_term, 0});
+        raft_options lo = quiet(50ms, 50ms, heartbeat);
+        lo.state = leader_state.get();
+        leader = std::make_unique<RaftNode>(leader_io, 1, std::vector<node_id>{2, 3}, leader_client, *leader_log, lo);
+        follower = std::make_unique<DiskFollower>(dir / "follower" / "kv.log", follower_terms);
+        leader->start();
+        run_until(leader_io, [&] { return !leader_client.votes.empty(); }, 2000ms);
+        leader_client.votes.at(0).cb(vote_reply(start_term + 1, true));
+        CHECK(leader->role() == raft_role::leader);
+    }
+
+    // Delivers the next heartbeat to node 2 and its reply back.
+    bool step() {
+        if (!run_until(leader_io, [&] { return !appends_to(leader_client, 2, seen).empty(); }, 1000ms)) { return false; }
+        auto* call = appends_to(leader_client, 2, seen).front();
+        seen = static_cast<std::size_t>(call - leader_client.appends.data()) + 1;
+        const append_entries_request req = call->req;
+        const append_entries_response resp = follower->node->handle_append_entries(req);
+        call->cb({rpc_error::none, resp});
+        rounds.push_back({req, resp, leader->progress()[2], follower->disk.last_index()});
+        return true;
+    }
+
+    bool converged() const { return terms_of(follower->disk) == terms_of(leader_disk); }
+};
+
+static std::string describe(const DiskPair::round& r) {
+    std::string out = "prev " + std::to_string(r.req.prev_log_index) + "@t" + std::to_string(r.req.prev_log_term);
+    if (!r.req.entries.empty()) {
+        out += " +" + std::to_string(r.req.entries.size()) + " [" + std::to_string(r.req.entries.front().index)
+             + ".." + std::to_string(r.req.entries.back().index) + "]";
+    }
+    return out + (r.resp.success ? " ok   -> " : " FAIL -> ") + "next " + std::to_string(r.after.next_index)
+         + "/match " + std::to_string(r.after.match_index) + ", follower last " + std::to_string(r.follower_last);
+}
+
+// The backward walk, then the repair, on real PersistentLogs that diverge after index 4:
 //   index:     1 2 3 4 | 5 6 7
 //   leader:    1 1 1 2 | 2 3 3
 //   follower:  1 1 1 2 | 4 4
-// The leader starts at nextIndex 8 and must step back to 5 (prev 4, the last
-// agreeing entry), succeed there, and then stay put.
-static void test_backward_walk() {
-    std::puts("test_backward_walk");
+// nextIndex steps 8 -> 5; the probe at prev 4 matches, the follower deletes
+// its 5..6 and stores the leader's 5..7; then matchIndex = 7 and it stays put.
+static void test_walk_back_and_repair() {
+    std::puts("test_walk_back_and_repair");
     ::alarm(20);
     TempDir dir;
-    CHECK(!dir.path.empty());
-    PersistentLog leader_log;
-    PersistentLog follower_log;
-    build_log(leader_log, dir.path / "leader" / "kv.log", {1, 1, 1, 2, 2, 3, 3});
-    build_log(follower_log, dir.path / "follower" / "kv.log", {1, 1, 1, 2, 4, 4});
-    const PersistentLogView leader_view(leader_log);
-    const PersistentLogView follower_view(follower_log);
+    DiskPair d(dir.path, {1, 1, 1, 2, 2, 3, 3}, {1, 1, 1, 2, 4, 4}, 4);
+    CHECK(d.leader->current_term() == 5);
+    for (int i = 0; i < 8; ++i) { CHECK(d.step()); }
+    std::printf("  start: next 8/match 0, follower last 6\n");
+    for (const auto& r : d.rounds) { std::printf("    %s\n", describe(r).c_str()); }
 
-    // The leader resumes at term 4 (from its state file) so it wins term 5,
-    // newer than any entry in either log.
-    RaftStateFile leader_state((dir.path / "leader" / "kv.log.raftstate").string(), 1);
-    leader_state.save({4, 0});
-    raft_options lo = quiet(50ms, 50ms, 20ms);
-    lo.state = &leader_state;
-    asio::io_context leader_io;
-    FakeClient leader_client;
-    RaftNode leader(leader_io, 1, {2, 3}, leader_client, leader_view, lo);
-
-    asio::io_context follower_io;
-    FakeClient follower_client;
-    RaftNode follower(follower_io, 2, {1, 3}, follower_client, follower_view, quiet(10s, 10s));
-    follower.start();
-
-    leader.start();
-    run_until(leader_io, [&] { return !leader_client.votes.empty(); }, 2000ms);
-    CHECK(leader.current_term() == 5);
-    leader_client.votes.at(0).cb(vote_reply(5, true));
-    CHECK(leader.role() == raft_role::leader);
-
-    // Deliver each heartbeat to the real follower and its reply back, one round at a time.
-    std::vector<std::string> trajectory;
-    std::vector<peer_progress> after;
-    std::size_t seen = 0;
-    const auto fmt = [](const peer_progress& p) {
-        return "next " + std::to_string(p.next_index) + "/match " + std::to_string(p.match_index);
-    };
-    trajectory.push_back("start: " + fmt(leader.progress()[2]));
-    for (int round = 0; round < 8; ++round) {
-        if (!run_until(leader_io, [&] { return !appends_to(leader_client, 2, seen).empty(); }, 1000ms)) { break; }
-        auto* call = appends_to(leader_client, 2, seen).front();
-        seen = static_cast<std::size_t>(call - leader_client.appends.data()) + 1;
-        const auto req = call->req;
-        CHECK(req.entries.empty() && req.leader_commit == 0);
-        const auto resp = follower.handle_append_entries(req);
-        call->cb({rpc_error::none, resp});
-        after.push_back(leader.progress()[2]);
-        trajectory.push_back("prev " + std::to_string(req.prev_log_index) + "@t" + std::to_string(req.prev_log_term)
-                             + (resp.success ? " ok   -> " : " FAIL -> ") + fmt(after.back()));
-    }
-    std::printf("  nextIndex[2] trajectory:\n");
-    for (const auto& line : trajectory) { std::printf("    %s\n", line.c_str()); }
-
-    CHECK(after.size() == 8);
-    if (after.size() == 8) {
-        const std::vector<std::uint64_t> want_next = {7, 6, 5, 5, 5, 5, 5, 5};
-        const std::vector<std::uint64_t> want_match = {0, 0, 0, 4, 4, 4, 4, 4};
-        for (std::size_t i = 0; i < after.size(); ++i) {
-            CHECK(after[i].next_index == want_next[i] && after[i].match_index == want_match[i]);
+    CHECK(d.rounds.size() == 8);
+    if (d.rounds.size() == 8) {
+        const std::vector<std::uint64_t> want_next = {7, 6, 5, 8, 8, 8, 8, 8};
+        const std::vector<std::uint64_t> want_match = {0, 0, 0, 7, 7, 7, 7, 7};
+        const std::vector<std::size_t> want_sent = {0, 1, 2, 3, 0, 0, 0, 0};
+        for (std::size_t i = 0; i < d.rounds.size(); ++i) {
+            CHECK(d.rounds[i].after.next_index == want_next[i] && d.rounds[i].after.match_index == want_match[i]);
+            CHECK(d.rounds[i].req.entries.size() == want_sent[i] && d.rounds[i].req.leader_commit == 0);
         }
     }
-    // The follower took every probe as from a legitimate leader and kept its log.
-    CHECK(follower.role() == raft_role::follower && follower.current_term() == 5);
-    CHECK(follower.status().leader_id == 1);
-    CHECK(follower_log.last_index() == 6);
-    CHECK(leader.role() == raft_role::leader && leader.current_term() == 5);
+    CHECK(d.converged());
+    CHECK(read_file(d.follower->path) == read_file(dir.path / "leader" / "kv.log"));  // byte-identical
+    CHECK(d.follower->node->role() == raft_role::follower && d.follower->node->current_term() == 5);
+    CHECK(d.leader->role() == raft_role::leader && d.leader->current_term() == 5);
+}
+
+// A follower far behind catches up over several bounded batches.
+static void test_batched_catch_up() {
+    std::puts("test_batched_catch_up");
+    ::alarm(60);
+    TempDir dir;
+    std::vector<std::uint64_t> leader_terms(200, 1);
+    for (std::size_t i = 100; i < 200; ++i) { leader_terms[i] = 2; }
+    const std::vector<std::uint64_t> follower_terms(10, 1);
+    DiskPair d(dir.path, leader_terms, follower_terms, 2, 1ms);
+    while (!d.converged() && d.rounds.size() < 400) { CHECK(d.step()); }
+    for (int i = 0; i < 5; ++i) { CHECK(d.step()); }  // and then it stays quiet
+
+    std::size_t max_batch = 0;
+    std::vector<std::size_t> batches;  // sizes of the batches that were stored
+    std::string trace = "10";
+    for (const auto& r : d.rounds) {
+        max_batch = std::max(max_batch, r.req.entries.size());
+        if (r.resp.success && !r.req.entries.empty()) {
+            batches.push_back(r.req.entries.size());
+            trace += " -> " + std::to_string(r.follower_last);
+        }
+    }
+    std::printf("  %zu rounds; follower last index: %s; largest batch %zu\n", d.rounds.size(), trace.c_str(), max_batch);
+    CHECK(d.converged());
+    CHECK(read_file(d.follower->path) == read_file(dir.path / "leader" / "kv.log"));
+    CHECK(max_batch == kMaxEntriesPerAppend);
+    CHECK(batches == std::vector<std::size_t>({64, 64, 62}));
+    CHECK(d.leader->progress()[2].match_index == 200 && d.leader->progress()[2].next_index == 201);
+    for (std::size_t i = d.rounds.size() - 5; i < d.rounds.size(); ++i) {
+        CHECK(d.rounds[i].resp.success && d.rounds[i].req.entries.empty() && d.rounds[i].follower_last == 200);
+    }
+}
+
+// Big entries: batches are cut by bytes, not count, and still converge.
+static void test_batch_byte_cap() {
+    std::puts("test_batch_byte_cap");
+    ::alarm(30);
+    TempDir dir;
+    const std::filesystem::path leader_path = dir.path / "leader" / "kv.log";
+    // 12 entries of ~300 KB: three fit under kMaxAppendBytes, four don't.
+    std::string frames;
+    for (std::uint64_t i = 1; i <= 12; ++i) {
+        frames += PersistentLog::encode_frame({i, 1, command{"PUT", "big" + std::to_string(i), std::string(300 * 1024, 'a' + i % 26)}});
+    }
+    std::filesystem::create_directories(leader_path.parent_path());
+    if (std::FILE* f = std::fopen(leader_path.c_str(), "wb")) { std::fwrite(frames.data(), 1, frames.size(), f); std::fclose(f); }
+
+    PersistentLog leader_disk;
+    leader_disk.open(leader_path.string());
+    StateMachine sm;
+    CHECK(leader_disk.replay(sm) == 12);
+    PersistentRaftLog leader_log(leader_disk);
+    asio::io_context io;
+    FakeClient client;
+    raft_options lo = quiet(50ms, 50ms, 1ms);
+    RaftNode leader(io, 1, {2, 3}, client, leader_log, lo);
+    DiskFollower follower(dir.path / "follower" / "kv.log", {});
+    leader.start();
+    run_until(io, [&] { return !client.votes.empty(); }, 2000ms);
+    client.votes.at(0).cb(vote_reply(1, true));
+
+    // With a 1ms heartbeat several requests are in flight at once: deliver
+    // all pending ones each round, in order, and record a batch only when it
+    // grew the follower's log (re-deliveries are idempotent no-ops).
+    std::size_t seen = 0;
+    std::vector<std::size_t> stored;
+    std::size_t largest_bytes = 0;
+    for (int round = 0; round < 200 && follower.disk.last_index() < 12; ++round) {
+        if (!run_until(io, [&] { return !appends_to(client, 2, seen).empty(); }, 1000ms)) { break; }
+        const std::size_t upto = client.appends.size();
+        for (std::size_t i = seen; i < upto; ++i) {
+            if (client.appends[i].peer != 2) { continue; }
+            const append_entries_request req = client.appends[i].req;
+            std::size_t bytes = 0;
+            for (const auto& e : req.entries) { bytes += PersistentLog::encode_frame(e).size(); }
+            largest_bytes = std::max(largest_bytes, bytes);
+            CHECK(req.entries.size() <= 1 || bytes <= kMaxAppendBytes);
+            std::string wire;
+            CHECK(encode_rpc_frame(req, wire));  // always fits in one RPC frame
+            const std::uint64_t before = follower.disk.last_index();
+            const auto resp = follower.node->handle_append_entries(req);
+            if (follower.disk.last_index() > before) { stored.push_back(follower.disk.last_index() - before); }
+            client.appends[i].cb({rpc_error::none, resp});
+        }
+        seen = upto;
+    }
+    std::printf("  stored batches of:");
+    for (const auto n : stored) { std::printf(" %zu", n); }
+    std::printf(" entries (~300 KB each); largest request %zu bytes of frames, cap %zu\n", largest_bytes, kMaxAppendBytes);
+    CHECK(stored == std::vector<std::size_t>({3, 3, 3, 3}));
+    CHECK(read_file(follower.path) == read_file(leader_path));
 }
 
 // Callbacks that arrive after the node is gone must not touch it.
@@ -721,7 +1033,7 @@ static void test_late_callbacks_after_destruction() {
     FakeClient client;
     PeerHandlers handlers;
     {
-        const FakeLog log;
+        FakeLog log;
         RaftNode node(io, 1, {2, 3}, client, log, quiet(20ms, 20ms));
         handlers = node.handlers();
         node.start();
@@ -799,10 +1111,12 @@ private:
 class LiveNode
 {
 public:
+    // With a `log_path` the node runs on a real PersistentLog there (replayed
+    // at start); otherwise on a FakeLog holding `log_terms`.
     LiveNode(node_id id, History& history, std::uint16_t port = 0, std::string state_path = {},
-             std::vector<std::uint64_t> log_terms = {})
-        : id_(id), history_(history), state_path_(std::move(state_path)) {
-        log_.terms = std::move(log_terms);
+             std::vector<std::uint64_t> log_terms = {}, std::string log_path = {})
+        : id_(id), history_(history), state_path_(std::move(state_path)), log_path_(std::move(log_path)) {
+        fake_log_.terms = std::move(log_terms);
         // Listen first (port 0) so every node's address is known before any
         // client is built; handlers forward to raft_, set before io runs.
         PeerHandlers fwd;
@@ -830,7 +1144,16 @@ public:
             state_ = std::make_unique<RaftStateFile>(state_path_, id_);
             opts.state = state_.get();
         }
-        raft_ = std::make_unique<RaftNode>(io_, id_, peers, *client_, log_, opts);
+        RaftLog* log = &fake_log_;
+        if (!log_path_.empty()) {
+            disk_log_ = std::make_unique<PersistentLog>();
+            disk_log_->open(log_path_);
+            StateMachine unused;  // replication never applies; replay needs somewhere to put it
+            disk_log_->replay(unused);
+            raft_log_ = std::make_unique<PersistentRaftLog>(*disk_log_);
+            log = raft_log_.get();
+        }
+        raft_ = std::make_unique<RaftNode>(io_, id_, peers, *client_, *log, opts);
         raft_->start();
         thread_ = std::thread([this] { io_.run(); });
     }
@@ -845,6 +1168,8 @@ public:
         raft_.reset();
         client_.reset();
         state_.reset();
+        raft_log_.reset();
+        disk_log_.reset();
     }
 
     std::uint16_t listen_port() const { return server_->local_endpoint().port(); }
@@ -857,11 +1182,22 @@ public:
         return result.get_future().get();
     }
 
+    // The node's last log index, read on its own io thread.
+    std::uint64_t last_index() {
+        if (!alive()) { return 0; }
+        std::promise<std::uint64_t> result;
+        asio::post(io_, [&] { result.set_value((raft_log_ ? static_cast<RaftLog&>(*raft_log_) : fake_log_).last().last_index); });
+        return result.get_future().get();
+    }
+
 private:
     node_id id_;
     History& history_;
     std::string state_path_;
-    FakeLog log_;
+    std::string log_path_;
+    FakeLog fake_log_;
+    std::unique_ptr<PersistentLog> disk_log_;
+    std::unique_ptr<PersistentRaftLog> raft_log_;
     asio::io_context io_;
     std::unique_ptr<RaftStateFile> state_;
     std::unique_ptr<PeerServer> server_;
@@ -874,13 +1210,15 @@ private:
 class Cluster
 {
 public:
-    // With a `state_dir`, node N keeps its term/vote in <state_dir>/nN.log.raftstate.
-    // `logs` gives node N a fixed log (terms per entry); nodes not listed have an empty one.
+    // With a `state_dir`, node N runs on a real log <state_dir>/nN.log and keeps
+    // its term/vote next to it; otherwise on an in-memory FakeLog. `logs` seeds
+    // node N's log (terms per entry, see fake_entry); nodes not listed start empty.
     explicit Cluster(std::size_t n, raft_options opts = {}, std::filesystem::path state_dir = {},
                      std::map<node_id, std::vector<std::uint64_t>> logs = {})
         : opts_(std::move(opts)), state_dir_(std::move(state_dir)), logs_(std::move(logs)) {
         for (node_id id = 1; id <= n; ++id) {
-            nodes_.push_back(std::make_unique<LiveNode>(id, history, 0, state_path(id), log_terms(id)));
+            if (!state_dir_.empty() && logs_.count(id)) { write_log_file(log_path(id), logs_.at(id)); }
+            nodes_.push_back(std::make_unique<LiveNode>(id, history, 0, state_path(id), log_terms(id), log_path(id)));
         }
         for (const auto& node : nodes_) {
             eps_[node->id()] = tcp::endpoint(asio::ip::address_v4::loopback(), node->listen_port());
@@ -892,9 +1230,14 @@ public:
 
     LiveNode& node(node_id id) { return *nodes_.at(id - 1); }
 
+    std::string log_path(node_id id) const {
+        if (state_dir_.empty()) { return {}; }
+        return (state_dir_ / ("n" + std::to_string(id) + ".log")).string();
+    }
+
     std::string state_path(node_id id) const {
         if (state_dir_.empty()) { return {}; }
-        return RaftStateFile::path_for_log((state_dir_ / ("n" + std::to_string(id) + ".log")).string());
+        return RaftStateFile::path_for_log(log_path(id));
     }
 
     // Crash a node, then bring up a fresh one with the same id, port and state file.
@@ -902,7 +1245,7 @@ public:
         auto& slot = nodes_.at(id - 1);
         const std::uint16_t port = slot->port();
         slot.reset();
-        slot = std::make_unique<LiveNode>(id, history, port, state_path(id), log_terms(id));
+        slot = std::make_unique<LiveNode>(id, history, port, state_path(id), log_terms(id), log_path(id));
         slot->start(eps_, opts_);
     }
 
@@ -1171,16 +1514,20 @@ static void test_cluster3_follower_restart() {
     CHECK(c.history.at_most_one_leader_per_term());
 }
 
-// Identical non-empty logs (three term-0 entries, as client writes make
-// today): every probe succeeds the first time, so matchIndex lands on 3 and
-// nextIndex never moves from 4. A rejection anywhere would leave it lower.
+// Identical non-empty logs on disk (three term-0 entries, as client writes
+// make today): every probe succeeds the first time, so matchIndex lands on 3,
+// nextIndex never moves from 4, and no entries are sent or stored.
 static void test_cluster3_identical_logs() {
     std::puts("test_cluster3_identical_logs");
     ::alarm(30);
+    TempDir dir;
     const std::vector<std::uint64_t> log = {0, 0, 0};
-    Cluster c(3, {}, {}, {{1, log}, {2, log}, {3, log}});
+    Cluster c(3, {}, dir.path, {{1, log}, {2, log}, {3, log}});
+    const std::string seeded = read_file(c.log_path(1));
     const auto a = elect_and_hold(c, "3-node identical logs", 1000ms);
     CHECK(c.history.at_most_one_leader_per_term());
+    // Nothing to ship and nothing to repair: no log was written to.
+    for (node_id id = 1; id <= 3; ++id) { CHECK(read_file(c.log_path(id)) == seeded); }
     if (!a) { return; }
     const auto p = c.node(a->leader).progress();
     CHECK(p.size() == 2);
@@ -1193,28 +1540,114 @@ static void test_cluster3_identical_logs() {
     }
 }
 
-// One follower is behind (2 entries vs 3+2): it can't win an election, and
-// the leader walks its nextIndex back over real sockets to 3 (prev 2 matches).
-// Rejected heartbeats still keep it a follower: no churn.
-static void test_cluster3_lagging_follower() {
-    std::puts("test_cluster3_lagging_follower");
-    ::alarm(30);
-    const std::vector<std::uint64_t> full = {0, 0, 0, 0, 0};
-    Cluster c(3, {}, {}, {{1, full}, {2, full}, {3, {0, 0}}});
-    const auto a = elect_and_hold(c, "3-node, node 3 behind", 1000ms);
-    CHECK(c.history.at_most_one_leader_per_term());
+// Waits until node `id`'s log has exactly `want` entries; returns the
+// distinct last-index values seen along the way (the convergence trace).
+static std::vector<std::uint64_t> await_last_index(Cluster& c, node_id id, std::uint64_t want,
+                                                   std::chrono::milliseconds deadline) {
+    std::vector<std::uint64_t> trace;
+    const auto start = steady::now();
+    while (ms_since(start) < deadline.count()) {
+        const std::uint64_t now = c.node(id).last_index();
+        if (trace.empty() || trace.back() != now) { trace.push_back(now); }
+        if (now == want) { break; }
+        std::this_thread::sleep_for(2ms);
+    }
+    return trace;
+}
+
+static std::string join(const std::vector<std::uint64_t>& v) {
+    std::string out;
+    for (const auto x : v) { out += (out.empty() ? "" : " -> ") + std::to_string(x); }
+    return out;
+}
+
+// A 10ms heartbeat: the step-by-one walk back costs a round per index, so
+// this keeps a follower ~100 entries behind to about a second.
+static raft_options fast_heartbeat() {
+    raft_options o;
+    o.heartbeat_interval = 10ms;
+    return o;
+}
+
+// One follower is far behind on disk (10 entries vs 120): it can't win an
+// election; the leader walks back to it, ships the rest in bounded batches,
+// and its log file ends byte-identical to the leader's. Then everything goes
+// quiet, and a kill + restart leaves it converged.
+static void test_cluster3_follower_catches_up() {
+    std::puts("test_cluster3_follower_catches_up");
+    ::alarm(40);
+    TempDir dir;
+    std::vector<std::uint64_t> full(120, 1);
+    for (std::size_t i = 60; i < 120; ++i) { full[i] = 2; }
+    // Everyone resumes at term 2, so the elected term is newer than every entry.
+    for (node_id id = 1; id <= 3; ++id) {
+        RaftStateFile(RaftStateFile::path_for_log((dir.path / ("n" + std::to_string(id) + ".log")).string()), id).save({2, 0});
+    }
+    Cluster c(3, fast_heartbeat(), dir.path, {{1, full}, {2, full}, {3, std::vector<std::uint64_t>(10, 1)}});
+    const auto a = c.await_agreement(3000ms);
+    CHECK(a.has_value());
     if (!a) { return; }
     CHECK(a->leader != 3);
-    const node_id other = a->leader == 1 ? 2 : 1;
+    std::printf("  node %llu leads term %llu\n", static_cast<unsigned long long>(a->leader),
+                static_cast<unsigned long long>(a->term));
+
+    const auto trace = await_last_index(c, 3, 120, 10000ms);
+    std::printf("  node 3 last index: %s\n", join(trace).c_str());
+    CHECK(!trace.empty() && trace.back() == 120);
+
+    // Quiet: no more writes to any log, nobody campaigns, the leader holds.
+    const long long t0 = c.history.now_ms();
+    std::map<node_id, std::string> files;
+    for (node_id id = 1; id <= 3; ++id) { files[id] = read_file(c.log_path(id)); }
+    std::this_thread::sleep_for(500ms);
+    for (node_id id = 1; id <= 3; ++id) { CHECK(read_file(c.log_path(id)) == files[id]); }
+    CHECK(files[3] == files[a->leader]);  // byte-identical to the leader
+    CHECK(c.history.elections_started_after(t0) == 0);
     const auto p = c.node(a->leader).progress();
-    std::printf("  leader %llu: nextIndex[%llu]=%llu/match %llu, nextIndex[3]=%llu/match %llu\n",
-                static_cast<unsigned long long>(a->leader), static_cast<unsigned long long>(other),
-                static_cast<unsigned long long>(p.at(other).next_index),
-                static_cast<unsigned long long>(p.at(other).match_index),
-                static_cast<unsigned long long>(p.at(3).next_index),
-                static_cast<unsigned long long>(p.at(3).match_index));
-    CHECK(p.at(other).next_index == 6 && p.at(other).match_index == 5);
-    CHECK(p.at(3).next_index == 3 && p.at(3).match_index == 2);
+    CHECK(p.at(3).match_index == 120 && p.at(3).next_index == 121);
+
+    // Crash and restart the follower: its replayed log is still the leader's,
+    // and the leader has nothing to send it.
+    c.restart(3);
+    const auto b = c.await_agreement(2000ms);
+    CHECK(b && b->leader == a->leader && b->term == a->term);
+    std::this_thread::sleep_for(300ms);
+    CHECK(c.node(3).last_index() == 120);
+    CHECK(read_file(c.log_path(3)) == files[a->leader]);
+    CHECK(c.history.elections_started_after(t0) == 0);
+    CHECK(c.history.at_most_one_leader_per_term());
+}
+
+// A follower whose tail is from a term the others never saw: it is truncated
+// back to the agreeing prefix and replaced with the leader's entries.
+//   nodes 1, 2:  1x5 then 3x5   (10 entries, last term 3)
+//   node 3:      1x5 then 2x7   (12 entries, last term 2: it can't win)
+static void test_cluster3_divergent_follower() {
+    std::puts("test_cluster3_divergent_follower");
+    ::alarm(30);
+    TempDir dir;
+    const std::vector<std::uint64_t> good = {1, 1, 1, 1, 1, 3, 3, 3, 3, 3};
+    const std::vector<std::uint64_t> stale = {1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2};
+    for (node_id id = 1; id <= 3; ++id) {
+        RaftStateFile(RaftStateFile::path_for_log((dir.path / ("n" + std::to_string(id) + ".log")).string()), id).save({3, 0});
+    }
+    Cluster c(3, fast_heartbeat(), dir.path, {{1, good}, {2, good}, {3, stale}});
+    const auto a = c.await_agreement(3000ms);
+    CHECK(a.has_value());
+    if (!a) { return; }
+    CHECK(a->leader != 3 && a->term >= 4);
+
+    // 12 -> 5 (truncated at 6) -> 10 is the expected path, though the 5 can
+    // be too brief to sample: the same request truncates and appends.
+    const auto trace = await_last_index(c, 3, 10, 5000ms);
+    std::printf("  node 3 last index: %s\n", join(trace).c_str());
+    std::this_thread::sleep_for(300ms);
+    CHECK(c.node(3).last_index() == 10);
+    CHECK(read_file(c.log_path(3)) == read_file(c.log_path(a->leader)));
+    write_log_file(dir.path / "want.log", good);
+    CHECK(read_file(c.log_path(3)) == read_file(dir.path / "want.log"));
+    CHECK(c.agreed() && c.agreed()->leader == a->leader);
+    CHECK(c.history.at_most_one_leader_per_term());
 }
 
 int main() {
@@ -1229,9 +1662,13 @@ int main() {
     test_late_callbacks_after_destruction();
     test_consistency_check();
     test_leader_progress();
+    test_success_advances_by_count();
     test_next_index_floor();
     test_reply_with_higher_term();
-    test_backward_walk();
+    test_follower_stores_entries();
+    test_walk_back_and_repair();
+    test_batched_catch_up();
+    test_batch_byte_cap();
 
     test_cluster3_happy_path();
     test_heartbeats_suppress_elections();
@@ -1242,7 +1679,8 @@ int main() {
     test_cluster3_persistent_state();
     test_cluster3_follower_restart();
     test_cluster3_identical_logs();
-    test_cluster3_lagging_follower();
+    test_cluster3_follower_catches_up();
+    test_cluster3_divergent_follower();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

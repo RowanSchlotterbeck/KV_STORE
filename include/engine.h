@@ -24,7 +24,8 @@ std::string process_line(const std::string& line);
 
 class PersistentLog;
 
-// The engine's persistent log, read-only, for Raft (last index/term, term_at).
-const PersistentLog& engine_log();
+// The engine's persistent log, for Raft. Raft may append and truncate it
+// (replication) but never applies what it stores: that's the commit step.
+PersistentLog& engine_log();
 
 #endif //KV_STORE_ENGINE_H
