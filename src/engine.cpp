@@ -34,8 +34,8 @@ engine_init_result init_engine(const std::string& log_path) {
     return {last, wal.recovered_tail_bytes()};
 }
 
-engine_log_position engine_last_log_position() {
-    return {wal.last_index(), wal.last_term()};
+const PersistentLog& engine_log() {
+    return wal;
 }
 
 

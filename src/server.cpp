@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
     // Destruction order matters: peer_server (holds raft's handlers) goes
     // first, then raft, then the client raft sends through, then its state file.
     std::optional<RaftStateFile> raft_state;
+    const PersistentLogView raft_log(engine_log());
     std::optional<ConnectPerRpcClient> peer_client;
     std::optional<RaftNode> raft;
     std::optional<PeerServer> peer_server;
@@ -151,10 +152,7 @@ int main(int argc, char** argv) {
         // Replies slower than the shortest election timeout are stale anyway.
         peer_client.emplace(io, endpoints, kElectionTimeoutMin);
         try {
-            raft.emplace(io, cluster->self_id(), cluster->peers(), *peer_client, [] {
-                const engine_log_position pos = engine_last_log_position();
-                return log_position{pos.last_index, pos.last_term};
-            }, options);
+            raft.emplace(io, cluster->self_id(), cluster->peers(), *peer_client, raft_log, options);
         } catch (const raft_state_error& e) {
             std::cerr << "Failed to load Raft state: " << e.what() << "\n";
             return 1;

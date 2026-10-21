@@ -22,13 +22,9 @@ engine_init_result init_engine(const std::string& log_path);
 
 std::string process_line(const std::string& line);
 
-struct engine_log_position
-{
-    std::uint64_t last_index; // index of the last log entry (0 if empty)
-    std::uint64_t last_term;  // term of that entry (0 if empty)
-};
+class PersistentLog;
 
-// Last index/term of the persistent log, for Raft's RequestVote up-to-date check.
-engine_log_position engine_last_log_position();
+// The engine's persistent log, read-only, for Raft (last index/term, term_at).
+const PersistentLog& engine_log();
 
 #endif //KV_STORE_ENGINE_H

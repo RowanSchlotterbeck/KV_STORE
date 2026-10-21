@@ -1,10 +1,12 @@
 #include "../include/raft_node.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <utility>
+#include "../include/wal.h"
 
 const char* to_string(raft_role role) {
     switch (role) {
@@ -15,10 +17,18 @@ const char* to_string(raft_role role) {
     return "?";
 }
 
+log_position PersistentLogView::last() const {
+    return {log_.last_index(), log_.last_term()};
+}
+
+std::optional<std::uint64_t> PersistentLogView::term_at(std::uint64_t index) const {
+    return log_.term_at(index);
+}
+
 RaftNode::RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peers, PeerClient& client,
-                   log_position_fn local_log, raft_options options)
+                   const RaftLogView& log, raft_options options)
     : self_(self), peers_(std::move(peers)), client_(client),
-      local_log_(std::move(local_log)), options_(std::move(options)),
+      log_(log), options_(std::move(options)),
       rng_(options_.seed != 0 ? options_.seed : std::random_device{}()),
       election_timer_(io), heartbeat_timer_(io) {
     if (options_.state) {
@@ -46,6 +56,10 @@ void RaftNode::log(const Args&... parts) const {
 
 raft_status RaftNode::status() const {
     return {self_, role_, current_term_, voted_for_, leader_id_};
+}
+
+std::map<node_id, peer_progress> RaftNode::progress() const {
+    return role_ == raft_role::leader ? progress_ : std::map<node_id, peer_progress>{};
 }
 
 void RaftNode::notify() {
@@ -111,7 +125,7 @@ void RaftNode::start_election() {
         return;
     }
 
-    const log_position mine = local_log_();
+    const log_position mine = log_.last();
     const request_vote_request req{current_term_, self_, mine.last_index, mine.last_term};
     for (const node_id peer : peers_) {
         client_.send_request_vote(peer, req,
@@ -144,6 +158,11 @@ void RaftNode::on_vote_reply(node_id peer, std::uint64_t election_term,
 void RaftNode::become_leader() {
     role_ = raft_role::leader;
     leader_id_ = self_;
+    // Optimistic start: assume every follower matches our whole log, and let
+    // failed consistency checks walk nextIndex back where that's wrong.
+    const std::uint64_t next = log_.last().last_index + 1;
+    progress_.clear();
+    for (const node_id peer : peers_) { progress_[peer] = {next, 0}; }
     ++election_gen_;  // a leader runs no election timeout
     election_timer_.cancel();
     log("WON ELECTION with ", votes_.size(), "/", peers_.size() + 1,
@@ -156,14 +175,22 @@ void RaftNode::become_leader() {
 
 void RaftNode::send_heartbeats() {
     if (role_ != raft_role::leader) { return; }
-    const log_position mine = local_log_();
-    // prev_log_* and leader_commit are best-effort values; nobody checks them yet.
-    const append_entries_request req{current_term_, self_, mine.last_index, mine.last_term, {}, 0};
     for (const node_id peer : peers_) {
+        // Per-follower probe at nextIndex - 1. No entries yet, and leader_commit stays 0.
+        peer_progress& p = progress_[peer];
+        std::optional<std::uint64_t> prev_term = log_.term_at(p.next_index - 1);
+        if (!prev_term) {
+            // Our log has no entry there (it can't shrink under a leader, so
+            // this is defensive): probe from our own end instead.
+            p.next_index = log_.last().last_index + 1;
+            prev_term = log_.term_at(p.next_index - 1);
+        }
+        const append_entries_request req{current_term_, self_, p.next_index - 1, prev_term.value_or(0), {}, 0};
         client_.send_append_entries(peer, req,
-            [this, alive = std::weak_ptr<char>(alive_)](rpc_result<append_entries_response> reply) {
+            [this, alive = std::weak_ptr<char>(alive_), peer, term = current_term_, prev = req.prev_log_index](
+                rpc_result<append_entries_response> reply) {
                 if (alive.expired()) { return; }
-                on_heartbeat_reply(reply);
+                on_heartbeat_reply(peer, term, prev, reply);
             });
     }
 
@@ -175,11 +202,33 @@ void RaftNode::send_heartbeats() {
     });
 }
 
-void RaftNode::on_heartbeat_reply(const rpc_result<append_entries_response>& reply) {
-    // success=false at an equal term means nothing yet (no log matching this chunk).
-    if (reply.ok() && reply.response.term > current_term_) {
-        step_down(reply.response.term, "AppendEntries reply", 0);
+void RaftNode::on_heartbeat_reply(node_id peer, std::uint64_t sent_term, std::uint64_t prev_log_index,
+                                  const rpc_result<append_entries_response>& reply) {
+    if (!reply.ok()) { return; }  // unreachable peer: the next heartbeat retries
+    if (reply.response.term > current_term_) {
+        step_down(reply.response.term, "AppendEntries reply", peer);
+        return;
     }
+    // Stale: sent in an earlier term, or we're no longer leader.
+    if (role_ != raft_role::leader || current_term_ != sent_term) { return; }
+    peer_progress& p = progress_[peer];
+    if (reply.response.success) {
+        // Entries are empty, so prev_log_index is exactly the point known to match.
+        p.match_index = std::max(p.match_index, prev_log_index);
+        p.next_index = p.match_index + 1;
+        return;
+    }
+    // Several heartbeats can be in flight with the same probe; only the reply
+    // to the current one may move nextIndex, so one mismatch steps back once.
+    if (prev_log_index + 1 != p.next_index) { return; }
+    if (p.next_index <= 1) {
+        // prev_log_index 0 always matches, so a follower can't reject it.
+        log("node ", peer, " rejected prev_log_index 0; nextIndex stays 1");
+        return;
+    }
+    p.next_index -= 1;
+    log("node ", peer, " rejected prev_log_index ", prev_log_index, "; nextIndex[", peer, "] ",
+        p.next_index + 1, " -> ", p.next_index);
 }
 
 // ---- term authority ----
@@ -192,6 +241,7 @@ void RaftNode::step_down(std::uint64_t new_term, const char* why, node_id from) 
     leader_id_ = 0;
     role_ = raft_role::follower;
     votes_.clear();
+    progress_.clear();
     ++heartbeat_gen_;
     heartbeat_timer_.cancel();
     const std::string source = from != 0 ? " from node " + std::to_string(from) : std::string();
@@ -230,7 +280,7 @@ request_vote_response RaftNode::handle_request_vote(const request_vote_request& 
         return {current_term_, false};
     }
 
-    const log_position mine = local_log_();
+    const log_position mine = log_.last();
     const bool up_to_date = req.last_log_term > mine.last_term
         || (req.last_log_term == mine.last_term && req.last_log_index >= mine.last_index);
     const bool free_to_vote = voted_for_ == 0 || voted_for_ == req.candidate_id;
@@ -270,6 +320,22 @@ append_entries_response RaftNode::handle_append_entries(const append_entries_req
         log("following leader node ", leader_id_);
         notify();
     }
+    // A current-term leader is legitimate even when our logs disagree, so the
+    // timer resets either way; success reports only the consistency check.
     reset_election_timer();
+
+    // prev_log_index 0 is the empty prefix every log shares: always a match.
+    if (req.prev_log_index == 0) { return {current_term_, true}; }
+    const std::optional<std::uint64_t> mine = log_.term_at(req.prev_log_index);
+    if (!mine) {
+        log("rejected AppendEntries from node ", req.leader_id, ": no entry at prev_log_index ",
+            req.prev_log_index, " (log ends at ", log_.last().last_index, ")");
+        return {current_term_, false};
+    }
+    if (*mine != req.prev_log_term) {
+        log("rejected AppendEntries from node ", req.leader_id, ": entry at prev_log_index ",
+            req.prev_log_index, " has term ", *mine, ", leader expects ", req.prev_log_term);
+        return {current_term_, false};
+    }
     return {current_term_, true};
 }

@@ -2,6 +2,7 @@
 // Every log lives in a fresh temp directory; nothing is written to the repo.
 // Standalone (no framework): exits non-zero if any check fails.
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -162,6 +163,55 @@ static void test_last_term_after_replay() {
     CHECK(log.last_index() == 2 && log.last_term() == 5);
     CHECK(log.append(put("c", "3")) == 3);  // appends still write term 0 for now
     CHECK(log.last_term() == 0);
+}
+
+// term_at(i): the term of entry i, 0 for index 0, nullopt past the end.
+static void test_term_at() {
+    std::puts("test_term_at");
+    const fs::path path = temp_log("term_at");
+    {
+        PersistentLog log;
+        log.open(path.string());
+        CHECK(log.term_at(0) == std::optional<std::uint64_t>(0));  // even before replay
+        CHECK(!log.term_at(1).has_value());
+        StateMachine sm;
+        CHECK(log.replay(sm) == 0);
+        CHECK(log.term_at(0) == std::optional<std::uint64_t>(0));  // empty log
+        CHECK(!log.term_at(1).has_value());
+    }
+    const std::vector<std::uint64_t> terms = {1, 1, 2, 2, 2, 5};
+    std::string frames;
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+        frames += PersistentLog::encode_frame(log_entry{i + 1, terms[i], put("k" + std::to_string(i), "v")});
+    }
+    append_raw(path, frames);
+
+    PersistentLog log;
+    log.open(path.string());
+    StateMachine sm;
+    CHECK(log.replay(sm) == terms.size());
+    CHECK(log.term_at(0) == std::optional<std::uint64_t>(0));
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+        CHECK(log.term_at(i + 1) == std::optional<std::uint64_t>(terms[i]));
+    }
+    CHECK(!log.term_at(terms.size() + 1).has_value());
+    CHECK(!log.term_at(1000).has_value());
+    CHECK(!log.term_at(UINT64_MAX).has_value());
+    // Appends extend it (term 0 until Raft assigns terms).
+    CHECK(log.append(put("x", "y")) == 7);
+    CHECK(log.term_at(7) == std::optional<std::uint64_t>(0));
+    CHECK(log.term_at(6) == std::optional<std::uint64_t>(5));
+    CHECK(!log.term_at(8).has_value());
+
+    // Reopening resets it until replay; a torn tail leaves no phantom entry.
+    log.close();
+    append_raw(path, PersistentLog::encode_frame(log_entry{8, 9, put("torn", "x")}).substr(0, 10));
+    log.open(path.string());
+    CHECK(!log.term_at(1).has_value());
+    StateMachine sm2;
+    CHECK(log.replay(sm2) == 7);
+    CHECK(log.term_at(7) == std::optional<std::uint64_t>(0));
+    CHECK(!log.term_at(8).has_value());
 }
 
 static void test_append_requires_replay() {
@@ -432,7 +482,7 @@ int main() {
         return 2;
     }
     g_tmp_root = tmpl;
-    for (const char* name : {"basic", "resume", "needs_replay", "non_utf8", "last_term"}) {
+    for (const char* name : {"basic", "resume", "needs_replay", "non_utf8", "last_term", "term_at"}) {
         fs::create_directories(g_tmp_root / name);
     }
 
@@ -442,6 +492,7 @@ int main() {
     test_index_resumes_after_reopen();
     test_append_requires_replay();
     test_last_term_after_replay();
+    test_term_at();
     test_non_utf8_survives_replay();
     test_torn_tail_recovery();
     test_zeroed_tail_recovery();

@@ -7,8 +7,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include "command.h"
 #include "log_entry.h"
 
@@ -70,6 +72,10 @@ public:
     std::uint64_t last_index() const { return last_index_; }
     // Term of the last entry (0 for an empty log). Raft's up-to-date check uses this.
     std::uint64_t last_term() const { return last_term_; }
+    // Term of the entry at `index`: 0 for index 0 (the empty prefix every log
+    // shares), nullopt if the log has no entry there. Raft's AppendEntries
+    // consistency check uses this.
+    std::optional<std::uint64_t> term_at(std::uint64_t index) const;
     // Bytes of torn or zeroed tail discarded by the last replay(); 0 if clean.
     std::uint64_t recovered_tail_bytes() const { return recovered_tail_bytes_; }
 
@@ -81,6 +87,7 @@ private:
     std::uint64_t last_index_ = 0;
     std::uint64_t last_term_ = 0;
     std::uint64_t end_offset_ = 0;  // file offset just past the last good entry
+    std::vector<std::uint64_t> terms_;  // terms_[i - 1] is the term of entry i
     std::uint64_t recovered_tail_bytes_ = 0;
     bool replayed_ = false;
     bool failed_ = false;

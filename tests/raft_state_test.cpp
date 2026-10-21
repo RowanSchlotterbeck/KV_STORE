@@ -87,17 +87,33 @@ public:
     std::function<void(const request_vote_request&)> on_send_vote;
 };
 
+// A log as a list of terms: terms[i - 1] is the term of entry i.
+struct FakeLog final : RaftLogView
+{
+    std::vector<std::uint64_t> terms;
+
+    log_position last() const override {
+        return terms.empty() ? log_position{} : log_position{terms.size(), terms.back()};
+    }
+    std::optional<std::uint64_t> term_at(std::uint64_t index) const override {
+        if (index == 0) { return 0; }
+        if (index > terms.size()) { return std::nullopt; }
+        return terms[index - 1];
+    }
+};
+
 // One node "process": the state file object and the node built on it. A
 // crash is destroying this and building another on the same path.
 struct Incarnation
 {
     asio::io_context io;
     FakeClient client;
+    FakeLog log;
     RaftStateFile state;
     RaftNode node;
 
     Incarnation(const std::string& path, std::chrono::milliseconds timeout = 10s)
-        : state(path, 1), node(io, 1, {2, 3}, client, [] { return log_position{}; }, options(timeout)) {}
+        : state(path, 1), node(io, 1, {2, 3}, client, log, options(timeout)) {}
 
     raft_options options(std::chrono::milliseconds timeout) {
         raft_options o;
@@ -249,7 +265,8 @@ static void test_vote_survives_restart() {
         raft_options o;
         o.election_timeout_min = o.election_timeout_max = 10s;
         o.log = kVerbose;
-        RaftNode before(io, 1, {2, 3}, c, [] { return log_position{}; }, o);
+        const FakeLog log;
+        RaftNode before(io, 1, {2, 3}, c, log, o);
         CHECK(before.handle_request_vote({1, 2, 0, 0}).vote_granted);
     }
     {
@@ -258,7 +275,8 @@ static void test_vote_survives_restart() {
         raft_options o;
         o.election_timeout_min = o.election_timeout_max = 10s;
         o.log = kVerbose;
-        RaftNode after(io, 1, {2, 3}, c, [] { return log_position{}; }, o);
+        const FakeLog log;
+        RaftNode after(io, 1, {2, 3}, c, log, o);
         CHECK(after.handle_request_vote({1, 3, 0, 0}).vote_granted);  // second vote in term 1
     }
 }
@@ -323,7 +341,9 @@ static void test_higher_term_adoption_persisted() {
             o.election_timeout_min = o.election_timeout_max = 10s;
             o.log = kVerbose;
             o.state = &state;
-            RaftNode node(io, 1, {2, 3}, c, [] { return log_position{4, 2}; }, o);
+            FakeLog log;
+            log.terms.assign(4, 2);  // 4 entries, last in term 2
+            RaftNode node(io, 1, {2, 3}, c, log, o);
             const auto r = node.handle_request_vote({7, 2, 1, 1});
             CHECK(!r.vote_granted && r.term == 7);
             CHECK(same(on_disk(path, 1), {7, 0}));

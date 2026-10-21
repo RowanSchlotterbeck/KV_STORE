@@ -1,9 +1,15 @@
 #ifndef KV_STORE_RAFT_NODE_H
 #define KV_STORE_RAFT_NODE_H
 
-// Raft leader election and heartbeats (Raft paper, Figure 2), and nothing
-// more: no log replication, no commit index, no log-matching check on
-// AppendEntries, no client routing.
+// Raft leader election, heartbeats and the AppendEntries log-consistency
+// check (Raft paper, Figure 2), and nothing more: heartbeats carry no
+// entries, so no log replication, no commit index, no client routing yet.
+//
+// Each heartbeat is a probe. The leader keeps nextIndex/matchIndex per
+// follower and sends prev_log_index = nextIndex - 1 with the term its own log
+// has there; a follower succeeds only if its log has that entry with that
+// term. On failure the leader steps nextIndex back by one, so successive
+// heartbeats walk back to the last index the two logs agree on.
 //
 // Everything runs on the caller's io_context: the RPC handlers, the RPC
 // reply callbacks, and both timers. No threads, no locks.
@@ -19,7 +25,9 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <vector>
@@ -34,10 +42,41 @@ constexpr std::chrono::milliseconds kHeartbeatInterval{50};  // well under kElec
 enum class raft_role { follower, candidate, leader };
 const char* to_string(raft_role role);
 
+class PersistentLog;
+
 struct log_position
 {
     std::uint64_t last_index = 0;
     std::uint64_t last_term = 0;
+};
+
+// Read-only view of the local log, as Raft needs it.
+class RaftLogView
+{
+public:
+    virtual ~RaftLogView() = default;
+    virtual log_position last() const = 0;
+    // Term of the entry at `index`: 0 for index 0, nullopt past the end.
+    virtual std::optional<std::uint64_t> term_at(std::uint64_t index) const = 0;
+};
+
+// RaftLogView over the node's PersistentLog. `log` must outlive the view.
+class PersistentLogView final : public RaftLogView
+{
+public:
+    explicit PersistentLogView(const PersistentLog& log) : log_(log) {}
+    log_position last() const override;
+    std::optional<std::uint64_t> term_at(std::uint64_t index) const override;
+
+private:
+    const PersistentLog& log_;
+};
+
+// A leader's view of one follower (Figure 2, "volatile state on leaders").
+struct peer_progress
+{
+    std::uint64_t next_index = 1;   // next log index to send; prev_log_index = next_index - 1
+    std::uint64_t match_index = 0;  // highest index known to match the leader's log
 };
 
 struct raft_status
@@ -68,13 +107,11 @@ struct raft_options
 class RaftNode
 {
 public:
-    using log_position_fn = std::function<log_position()>;
-
     // `peers` is every other node in the cluster; the cluster size used for
-    // majorities is peers.size() + 1. `client` must outlive the node.
+    // majorities is peers.size() + 1. `client` and `log` must outlive the node.
     // Throws raft_state_error if options.state can't be loaded.
     RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peers, PeerClient& client,
-             log_position_fn local_log, raft_options options = {});
+             const RaftLogView& log, raft_options options = {});
     ~RaftNode();
     RaftNode(const RaftNode&) = delete;
     RaftNode& operator=(const RaftNode&) = delete;
@@ -93,6 +130,8 @@ public:
     raft_role role() const { return role_; }
     std::uint64_t current_term() const { return current_term_; }
     std::size_t majority() const { return (peers_.size() + 1) / 2 + 1; }
+    // Per-follower progress while leader; empty otherwise.
+    std::map<node_id, peer_progress> progress() const;
 
 private:
     void reset_election_timer();
@@ -101,7 +140,8 @@ private:
                        const rpc_result<request_vote_response>& reply);
     void become_leader();
     void send_heartbeats();
-    void on_heartbeat_reply(const rpc_result<append_entries_response>& reply);
+    void on_heartbeat_reply(node_id peer, std::uint64_t sent_term, std::uint64_t prev_log_index,
+                            const rpc_result<append_entries_response>& reply);
     void step_down(std::uint64_t new_term, const char* why, node_id from);
     // Durably records term/vote, then updates the in-memory copy.
     void persist(std::uint64_t term, node_id voted_for);
@@ -111,7 +151,7 @@ private:
     node_id self_;
     std::vector<node_id> peers_;
     PeerClient& client_;
-    log_position_fn local_log_;
+    const RaftLogView& log_;
     raft_options options_;
     std::mt19937_64 rng_;
 
@@ -120,6 +160,7 @@ private:
     raft_role role_ = raft_role::follower;
     node_id leader_id_ = 0;
     std::set<node_id> votes_;  // granted to us in current_term_ (candidate only)
+    std::map<node_id, peer_progress> progress_;  // leader only; reset on every win
 
     asio::steady_timer election_timer_;
     asio::steady_timer heartbeat_timer_;

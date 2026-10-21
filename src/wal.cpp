@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 #include "../include/crc32c.h"
 #include "../include/durable_io.h"
 #include "../include/serialization.h"
@@ -72,6 +73,7 @@ void PersistentLog::open(const std::string& path) {
     last_index_ = 0;
     last_term_ = 0;
     end_offset_ = 0;
+    terms_.clear();
     recovered_tail_bytes_ = 0;
     replayed_ = false;
     failed_ = false;
@@ -114,6 +116,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
     std::size_t offset = 0;
     std::uint64_t last = 0;
     std::uint64_t last_term = 0;
+    std::vector<std::uint64_t> terms;
     const auto corrupt = [&](const std::string& why) {
         return wal_error("corrupt log " + path_ + ": " + why + " in entry at byte offset "
                          + std::to_string(offset) + " of " + std::to_string(size)
@@ -161,6 +164,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
         sm.apply(entry.cmd);
         last = entry.index;
         last_term = entry.term;
+        terms.push_back(entry.term);
         offset += kHeaderSize + len;
     }
 
@@ -175,6 +179,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
     last_index_ = last;
     last_term_ = last_term;
     end_offset_ = offset;
+    terms_ = std::move(terms);
     replayed_ = true;
     return last_index_;
 }
@@ -220,4 +225,11 @@ void PersistentLog::append_entry(const log_entry& entry) {
     end_offset_ += frame.size();
     last_index_ = entry.index;
     last_term_ = entry.term;
+    terms_.push_back(entry.term);
+}
+
+std::optional<std::uint64_t> PersistentLog::term_at(std::uint64_t index) const {
+    if (index == 0) { return 0; }
+    if (index > terms_.size()) { return std::nullopt; }
+    return terms_[index - 1];
 }
