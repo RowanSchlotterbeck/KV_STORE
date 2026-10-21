@@ -46,11 +46,13 @@ add_library(kv_core
         src/serialization.cpp
         src/wal.cpp
         src/crc32c.cpp
+        src/durable_io.cpp
         src/raft_convert.cpp
         src/rpc_frame.cpp
         src/peer_config.cpp
         src/peer_transport.cpp
         src/raft_node.cpp
+        src/raft_state.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -207,3 +209,22 @@ target_compile_definitions(kv_raft_election_test PRIVATE
 
 add_test(NAME raft_election COMMAND kv_raft_election_test)
 set_tests_properties(raft_election PROPERTIES TIMEOUT 120)
+
+add_executable(kv_raft_state_test
+        tests/raft_state_test.cpp
+)
+
+target_link_libraries(kv_raft_state_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_raft_state_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_raft_state_test PRIVATE
+        ASIO_STANDALONE
+)
+
+add_test(NAME raft_state COMMAND kv_raft_state_test)
+set_tests_properties(raft_state PROPERTIES TIMEOUT 60)

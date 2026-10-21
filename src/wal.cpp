@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "../include/crc32c.h"
+#include "../include/durable_io.h"
 #include "../include/serialization.h"
 #include "../include/state_machine.h"
 
@@ -20,30 +21,6 @@ namespace
 {
     std::string errno_message(const std::string& what, const std::string& path) {
         return what + " " + path + ": " + std::strerror(errno);
-    }
-
-    // Flushes file data to stable storage. On macOS plain fsync() only reaches
-    // the drive's cache; F_FULLFSYNC asks the drive to flush it too.
-    bool full_sync(int fd) {
-#ifdef __APPLE__
-        if (::fcntl(fd, F_FULLFSYNC) == 0) { return true; }
-        if (errno != ENOTSUP && errno != EINVAL) { return false; }
-        // Filesystem doesn't support F_FULLFSYNC; fall back to fsync.
-#endif
-        return ::fsync(fd) == 0;
-    }
-
-    bool write_all(int fd, const char* data, std::size_t size) {
-        while (size > 0) {
-            const ssize_t n = ::write(fd, data, size);
-            if (n < 0) {
-                if (errno == EINTR) { continue; }
-                return false;
-            }
-            data += n;
-            size -= static_cast<std::size_t>(n);
-        }
-        return true;
     }
 
     std::uint32_t load_u32_le(const char* p) {
@@ -64,15 +41,6 @@ namespace
         char buf[11];
         std::snprintf(buf, sizeof(buf), "0x%08X", v);
         return buf;
-    }
-
-    // Makes a newly created file's directory entry durable.
-    bool sync_directory(const std::filesystem::path& dir) {
-        const int dfd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_CLOEXEC);
-        if (dfd < 0) { return false; }
-        const bool ok = full_sync(dfd);
-        ::close(dfd);
-        return ok;
     }
 }
 

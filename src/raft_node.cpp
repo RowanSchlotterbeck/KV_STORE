@@ -1,5 +1,6 @@
 #include "../include/raft_node.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -19,7 +20,13 @@ RaftNode::RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peer
     : self_(self), peers_(std::move(peers)), client_(client),
       local_log_(std::move(local_log)), options_(std::move(options)),
       rng_(options_.seed != 0 ? options_.seed : std::random_device{}()),
-      election_timer_(io), heartbeat_timer_(io) {}
+      election_timer_(io), heartbeat_timer_(io) {
+    if (options_.state) {
+        const raft_hard_state saved = options_.state->load();
+        current_term_ = saved.term;
+        voted_for_ = saved.voted_for;
+    }
+}
 
 RaftNode::~RaftNode() {
     alive_.reset();
@@ -51,6 +58,10 @@ void RaftNode::start() {
     log("starting; cluster of ", peers_.size() + 1, " (peers:", peers.str(), "), majority ",
         majority(), ", election timeout ", options_.election_timeout_min.count(), "-",
         options_.election_timeout_max.count(), "ms, heartbeat ", options_.heartbeat_interval.count(), "ms");
+    if (options_.state) {
+        log("persistent state ", options_.state->path(), ": term ", current_term_, ", voted for ",
+            voted_for_ != 0 ? "node " + std::to_string(voted_for_) : std::string("none"));
+    }
     notify();
     reset_election_timer();
 }
@@ -86,9 +97,8 @@ void RaftNode::reset_election_timer() {
 
 void RaftNode::start_election() {
     const std::uint64_t old_term = current_term_;
-    current_term_ += 1;
+    persist(current_term_ + 1, self_);  // on disk before any RequestVote goes out
     role_ = raft_role::candidate;
-    voted_for_ = self_;
     leader_id_ = 0;
     votes_ = {self_};
     log("election timeout: term ", old_term, " -> ", current_term_,
@@ -178,8 +188,7 @@ void RaftNode::step_down(std::uint64_t new_term, const char* why, node_id from) 
     const bool was_leader = role_ == raft_role::leader;
     const raft_role old_role = role_;
     const std::uint64_t old_term = current_term_;
-    current_term_ = new_term;
-    voted_for_ = 0;
+    persist(new_term, 0);  // on disk before the caller replies or acts on the new term
     leader_id_ = 0;
     role_ = raft_role::follower;
     votes_.clear();
@@ -193,6 +202,23 @@ void RaftNode::step_down(std::uint64_t new_term, const char* why, node_id from) 
     // Followers and candidates already have an election timer running; a
     // leader had none, so it needs one now or it would never time out.
     if (was_leader) { reset_election_timer(); }
+}
+
+void RaftNode::persist(std::uint64_t term, node_id voted_for) {
+    if (term == current_term_ && voted_for == voted_for_) { return; }  // e.g. a repeat vote for the same candidate
+    if (options_.state) {
+        try {
+            options_.state->save({term, voted_for});
+        } catch (const raft_state_error& e) {
+            // Continuing would mean sending or replying on a term/vote a
+            // restart could forget, which is exactly how double votes happen.
+            std::cerr << "[raft node " << self_ << "] FATAL: cannot persist term " << term
+                      << ", voted for " << voted_for << ": " << e.what() << "\n";
+            std::abort();
+        }
+    }
+    current_term_ = term;
+    voted_for_ = voted_for;
 }
 
 // ---- RPC handlers ----
@@ -210,7 +236,7 @@ request_vote_response RaftNode::handle_request_vote(const request_vote_request& 
     const bool free_to_vote = voted_for_ == 0 || voted_for_ == req.candidate_id;
 
     if (free_to_vote && up_to_date) {
-        voted_for_ = req.candidate_id;
+        persist(current_term_, req.candidate_id);  // on disk before the grant is returned
         log("granted vote to node ", req.candidate_id);
         notify();
         reset_election_timer();

@@ -71,7 +71,9 @@ This produces:
 
 With `--cluster <file> --node-id <id>` the server also listens for peer RPCs
 on that node's `peer_port` from the config and takes part in leader election,
-logging role and term changes to stderr. `--client-port <port>` (default
+logging role and term changes to stderr. Its Raft `currentTerm`/`votedFor`
+are fsynced to `<log_path>.raftstate` before it acts on them, so a restarted
+node keeps its vote; a corrupt state file stops startup. `--client-port <port>` (default
 5555) lets several nodes share one machine. Without `--cluster` it runs
 single-node, exactly as before.
 
@@ -165,9 +167,7 @@ round trip, not the engine, is the bottleneck for real client traffic.
 ## Known limitations
 
 - Cluster mode elects a leader but does not replicate: each node still
-  applies client writes to its own log, wherever they arrive. Raft's
-  `currentTerm`/`votedFor` are kept in memory only, so a node restarted
-  mid-term can vote twice in that term (to be fixed before replication).
+  applies client writes to its own log, wherever they arrive.
   Every write is fsynced individually (no batching), so
   write throughput is bounded by disk sync latency.
 - No authentication, TLS, or multi-database support.

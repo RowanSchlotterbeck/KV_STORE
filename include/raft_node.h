@@ -8,10 +8,12 @@
 // Everything runs on the caller's io_context: the RPC handlers, the RPC
 // reply callbacks, and both timers. No threads, no locks.
 //
-// KNOWN GAP (deliberately deferred): current_term and voted_for live only in
-// memory. A node that restarts mid-term forgets its vote and can vote twice
-// in that term, which can elect two leaders in one term. They must be
-// persisted (and fsynced before replying) before log replication lands.
+// current_term and voted_for are kept in memory as the working copy and, when
+// raft_options::state is set, written durably through it before the node acts
+// on a new value: before granting a vote, before sending RequestVote for a new
+// election, and before acting on a higher term seen in any RPC. A node that
+// restarts mid-term therefore still remembers its vote. If a save fails the
+// node crash-stops (aborts) rather than run on a term/vote that isn't on disk.
 
 #include <asio.hpp>
 #include <chrono>
@@ -22,6 +24,7 @@
 #include <set>
 #include <vector>
 #include "raft_messages.h"
+#include "raft_state.h"
 #include "../network/peer_transport.h"
 
 constexpr std::chrono::milliseconds kElectionTimeoutMin{150};
@@ -56,6 +59,10 @@ struct raft_options
     bool log = true;            // human-readable transitions on stderr
     // Called (on the io_context thread) after every role, term or leader change.
     std::function<void(const raft_status&)> on_change;
+    // Durable backing for current_term/voted_for, loaded by the constructor
+    // and must outlive the node. Null keeps them in memory only (unit tests
+    // that don't exercise restarts); the server always sets it.
+    RaftStateFile* state = nullptr;
 };
 
 class RaftNode
@@ -65,6 +72,7 @@ public:
 
     // `peers` is every other node in the cluster; the cluster size used for
     // majorities is peers.size() + 1. `client` must outlive the node.
+    // Throws raft_state_error if options.state can't be loaded.
     RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peers, PeerClient& client,
              log_position_fn local_log, raft_options options = {});
     ~RaftNode();
@@ -95,6 +103,8 @@ private:
     void send_heartbeats();
     void on_heartbeat_reply(const rpc_result<append_entries_response>& reply);
     void step_down(std::uint64_t new_term, const char* why, node_id from);
+    // Durably records term/vote, then updates the in-memory copy.
+    void persist(std::uint64_t term, node_id voted_for);
     void notify();
     template <typename... Args> void log(const Args&... parts) const;
 

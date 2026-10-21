@@ -8,8 +8,9 @@
 // transition so Election Safety is checked over the complete history, not
 // by sampling.
 //
-// Isolation: listeners bind 127.0.0.1 port 0 (OS-assigned); no files are
-// written; every node thread is stopped and joined by RAII even on failure;
+// Isolation: listeners bind 127.0.0.1 port 0 (OS-assigned); the persistent
+// cluster tests write term/vote files only under their own mkdtemp directory,
+// removed afterwards; every node thread is stopped and joined by RAII even on failure;
 // each test re-arms alarm() so a hang fails rather than stalling CTest.
 // Set RAFT_TEST_VERBOSE=1 to see the nodes' own stderr logs.
 // Standalone (no framework): exits non-zero if any check fails.
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -474,17 +476,20 @@ private:
     std::map<node_id, raft_status> latest_;
 };
 
-// One cluster member: io_context + thread + PeerServer + client + RaftNode.
+// One cluster member: io_context + thread + PeerServer + client + RaftNode,
+// plus its term/vote file when `state_path` is given. `port` 0 picks a free
+// one; a restarted node passes its old port so peers can still reach it.
 class LiveNode
 {
 public:
-    LiveNode(node_id id, History& history) : id_(id), history_(history) {
+    LiveNode(node_id id, History& history, std::uint16_t port = 0, std::string state_path = {})
+        : id_(id), history_(history), state_path_(std::move(state_path)) {
         // Listen first (port 0) so every node's address is known before any
         // client is built; handlers forward to raft_, set before io runs.
         PeerHandlers fwd;
         fwd.on_request_vote = [this](const request_vote_request& r) { return raft_->handle_request_vote(r); };
         fwd.on_append_entries = [this](const append_entries_request& r) { return raft_->handle_append_entries(r); };
-        server_ = std::make_unique<PeerServer>(io_, tcp::endpoint(asio::ip::address_v4::loopback(), 0), fwd);
+        server_ = std::make_unique<PeerServer>(io_, tcp::endpoint(asio::ip::address_v4::loopback(), port), fwd);
     }
 
     ~LiveNode() { kill(); }
@@ -502,6 +507,10 @@ public:
         opts.on_change = [this](const raft_status& s) { history_.record(s); };
         opts.seed = 1000 + id_ * 7919 + static_cast<std::uint64_t>(steady::now().time_since_epoch().count());
         opts.log = kVerbose;
+        if (!state_path_.empty()) {
+            state_ = std::make_unique<RaftStateFile>(state_path_, id_);
+            opts.state = state_.get();
+        }
         raft_ = std::make_unique<RaftNode>(io_, id_, peers, *client_, [] { return log_position{}; }, opts);
         raft_->start();
         thread_ = std::thread([this] { io_.run(); });
@@ -516,6 +525,7 @@ public:
         server_.reset();
         raft_.reset();
         client_.reset();
+        state_.reset();
     }
 
     std::uint16_t listen_port() const { return server_->local_endpoint().port(); }
@@ -523,7 +533,9 @@ public:
 private:
     node_id id_;
     History& history_;
+    std::string state_path_;
     asio::io_context io_;
+    std::unique_ptr<RaftStateFile> state_;
     std::unique_ptr<PeerServer> server_;
     std::unique_ptr<ConnectPerRpcClient> client_;
     std::unique_ptr<RaftNode> raft_;
@@ -534,18 +546,35 @@ private:
 class Cluster
 {
 public:
-    explicit Cluster(std::size_t n, raft_options opts = {}) {
-        for (node_id id = 1; id <= n; ++id) { nodes_.push_back(std::make_unique<LiveNode>(id, history)); }
-        peer_endpoints eps;
-        for (const auto& node : nodes_) {
-            eps[node->id()] = tcp::endpoint(asio::ip::address_v4::loopback(), node->listen_port());
+    // With a `state_dir`, node N keeps its term/vote in <state_dir>/nN.log.raftstate.
+    explicit Cluster(std::size_t n, raft_options opts = {}, std::filesystem::path state_dir = {})
+        : opts_(std::move(opts)), state_dir_(std::move(state_dir)) {
+        for (node_id id = 1; id <= n; ++id) {
+            nodes_.push_back(std::make_unique<LiveNode>(id, history, 0, state_path(id)));
         }
-        for (const auto& node : nodes_) { node->start(eps, opts); }
+        for (const auto& node : nodes_) {
+            eps_[node->id()] = tcp::endpoint(asio::ip::address_v4::loopback(), node->listen_port());
+        }
+        for (const auto& node : nodes_) { node->start(eps_, opts_); }
     }
 
     ~Cluster() { for (auto& n : nodes_) { n->kill(); } }
 
     LiveNode& node(node_id id) { return *nodes_.at(id - 1); }
+
+    std::string state_path(node_id id) const {
+        if (state_dir_.empty()) { return {}; }
+        return RaftStateFile::path_for_log((state_dir_ / ("n" + std::to_string(id) + ".log")).string());
+    }
+
+    // Crash a node, then bring up a fresh one with the same id, port and state file.
+    void restart(node_id id) {
+        auto& slot = nodes_.at(id - 1);
+        const std::uint16_t port = slot->port();
+        slot.reset();
+        slot = std::make_unique<LiveNode>(id, history, port, state_path(id));
+        slot->start(eps_, opts_);
+    }
 
     struct agreement { node_id leader = 0; std::uint64_t term = 0; };
 
@@ -594,7 +623,24 @@ public:
     History history;
 
 private:
+    raft_options opts_;
+    std::filesystem::path state_dir_;
+    peer_endpoints eps_;
     std::vector<std::unique_ptr<LiveNode>> nodes_;
+};
+
+// A fresh directory for one test's state files, removed when it goes out of scope.
+struct TempDir
+{
+    std::filesystem::path path;
+    TempDir() {
+        std::string tmpl = (std::filesystem::temp_directory_path() / "kv_raft_election_test.XXXXXX").string();
+        if (::mkdtemp(tmpl.data())) { path = tmpl; }
+    }
+    ~TempDir() {
+        std::error_code ec;
+        if (!path.empty()) { std::filesystem::remove_all(path, ec); }
+    }
 };
 
 // Elects, then holds steady for `hold` with no churn. Returns the agreement.
@@ -740,6 +786,69 @@ static void test_repeated_elections() {
     std::printf("\n");
 }
 
+// The happy path again with every node persisting term/vote: the fsyncs on the
+// election path must not cost stability, and the files must match memory.
+static void test_cluster3_persistent_state() {
+    std::puts("test_cluster3_persistent_state");
+    ::alarm(30);
+    TempDir dir;
+    CHECK(!dir.path.empty());
+    Cluster c(3, {}, dir.path);
+    const auto a = elect_and_hold(c, "3-node persistent", 1000ms);
+    CHECK(c.history.at_most_one_leader_per_term());
+    if (!a) { return; }
+    const auto latest = c.history.latest();
+    for (node_id id = 1; id <= 3; ++id) {
+        const raft_hard_state disk = RaftStateFile(c.state_path(id), id).load();
+        CHECK(disk.term == a->term);
+        CHECK(disk.voted_for == latest.at(id).voted_for);  // file and memory agree
+    }
+    CHECK(RaftStateFile(c.state_path(a->leader), a->leader).load().voted_for == a->leader);
+}
+
+// A follower crashes and restarts on its saved state: it comes back at the
+// current term and simply follows; no new election, no second leader.
+static void test_cluster3_follower_restart() {
+    std::puts("test_cluster3_follower_restart");
+    ::alarm(30);
+    TempDir dir;
+    CHECK(!dir.path.empty());
+    Cluster c(3, {}, dir.path);
+    const auto a = elect_and_hold(c, "3-node persistent", 300ms);
+    if (!a) { return; }
+    const node_id follower = a->leader == 1 ? 2 : 1;
+    const raft_hard_state before = RaftStateFile(c.state_path(follower), follower).load();
+    CHECK(before.term == a->term);
+
+    const long long t0 = c.history.now_ms();
+    c.node(follower).kill();
+    std::this_thread::sleep_for(100ms);  // down for a couple of heartbeats
+    c.restart(follower);
+    std::printf("  restarted follower node %llu (saved term %llu, voted for %llu)\n",
+                static_cast<unsigned long long>(follower), static_cast<unsigned long long>(before.term),
+                static_cast<unsigned long long>(before.voted_for));
+
+    // Its first status after restart is the saved term, not term 0.
+    bool saw_restart = false;
+    for (const auto& e : c.history.events()) {
+        if (e.at_ms > t0 && e.s.id == follower) {
+            CHECK(e.s.term == before.term && e.s.voted_for == before.voted_for);
+            saw_restart = true;
+            break;
+        }
+    }
+    CHECK(saw_restart);
+
+    const auto b = c.await_agreement(2000ms);
+    CHECK(b.has_value());
+    if (b) { CHECK(b->leader == a->leader && b->term == a->term); }
+    std::this_thread::sleep_for(1000ms);
+    CHECK(c.history.elections_started_after(t0) == 0);
+    const auto later = c.agreed();
+    CHECK(later && later->leader == a->leader && later->term == a->term);
+    CHECK(c.history.at_most_one_leader_per_term());
+}
+
 int main() {
     ::alarm(20);
     test_majority_math();
@@ -757,6 +866,8 @@ int main() {
     test_cluster5_with_two_failovers();
     test_minority_cannot_elect();
     test_repeated_elections();
+    test_cluster3_persistent_state();
+    test_cluster3_follower_restart();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
