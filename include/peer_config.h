@@ -3,15 +3,16 @@
 
 // Static cluster membership, loaded once at startup.
 //
-// File format: one node per line, three whitespace-separated fields,
+// File format: one node per line, three or four whitespace-separated fields,
 //
-//   <node_id> <host> <peer_port>
+//   <node_id> <host> <peer_port> [<client_port>]
 //
 // '#' starts a comment; blank lines are ignored. Every node in the cluster is
 // listed, including this one; the process is told its own id separately
 // (--node-id). peer_port is the node-to-node RPC port and is always given
-// explicitly per node, never derived. The client line-protocol port is
-// separate and unchanged.
+// explicitly per node, never derived. client_port, if given, is that node's
+// client line-protocol port: a follower uses it to redirect clients to the
+// leader, and a node started without --client-port listens on its own.
 //
 // Node id 0 is rejected: Raft code uses 0 to mean "no node" (e.g. no vote).
 // This header has no networking; host names are resolved by the transport.
@@ -34,7 +35,8 @@ public:
 struct peer_address
 {
     std::string host;
-    std::uint16_t port = 0;
+    std::uint16_t port = 0;                    // peer RPC port
+    std::optional<std::uint16_t> client_port;  // client protocol port, if configured
 };
 
 class ClusterConfig

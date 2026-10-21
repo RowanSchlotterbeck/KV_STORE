@@ -12,8 +12,9 @@
 namespace
 {
     constexpr char kMagic[4] = {'K', 'V', 'R', 'S'};
-    constexpr std::uint32_t kVersion = 1;
-    constexpr std::size_t kCrcOffset = 32;
+    constexpr std::uint32_t kVersion = 2;
+    constexpr std::size_t kCrcOffset = 40;
+    constexpr std::size_t kCrcOffsetV1 = 32;
 
     std::string errno_message(const std::string& what, const std::string& path) {
         return what + " " + path + ": " + std::strerror(errno);
@@ -37,6 +38,7 @@ std::string RaftStateFile::encode(node_id owner, const raft_hard_state& state) {
     store_le(out, owner, 8);
     store_le(out, state.term, 8);
     store_le(out, state.voted_for, 8);
+    store_le(out, state.commit_index, 8);
     store_le(out, crc32c(out), 4);
     return out;
 }
@@ -69,20 +71,27 @@ raft_hard_state RaftStateFile::load() const {
         return raft_state_error("corrupt raft state file " + path_ + ": " + why + "; refusing to start");
     };
     if (got > kSize) { throw corrupt("size is over " + std::to_string(kSize) + " bytes"); }
-    if (got < kSize) {
-        throw corrupt("size is " + std::to_string(got) + " bytes, expected " + std::to_string(kSize));
+    if (got != kSize && got != kSizeV1) {
+        throw corrupt("size is " + std::to_string(got) + " bytes, expected " + std::to_string(kSize)
+                      + " (or " + std::to_string(kSizeV1) + " for version 1)");
     }
     if (std::memcmp(buf, kMagic, sizeof(kMagic)) != 0) { throw corrupt("bad magic"); }
-    const std::uint32_t stored_crc = static_cast<std::uint32_t>(load_le(buf + kCrcOffset, 4));
-    if (crc32c(buf, kCrcOffset) != stored_crc) { throw corrupt("checksum mismatch"); }
+    // The size says which layout to checksum; the version must then agree.
+    const bool v1 = got == kSizeV1;
+    const std::size_t crc_at = v1 ? kCrcOffsetV1 : kCrcOffset;
+    const std::uint32_t stored_crc = static_cast<std::uint32_t>(load_le(buf + crc_at, 4));
+    if (crc32c(buf, crc_at) != stored_crc) { throw corrupt("checksum mismatch"); }
     const auto version = load_le(buf + 4, 4);
-    if (version != kVersion) { throw corrupt("unsupported version " + std::to_string(version)); }
+    if (version != (v1 ? 1u : kVersion)) {
+        throw corrupt("unsupported version " + std::to_string(version) + " in a " + std::to_string(got)
+                      + "-byte file");
+    }
     const node_id owner = load_le(buf + 8, 8);
     if (owner != self_) {
         throw corrupt("written by node " + std::to_string(owner) + ", but this is node "
                       + std::to_string(self_));
     }
-    return {load_le(buf + 16, 8), load_le(buf + 24, 8)};
+    return {load_le(buf + 16, 8), load_le(buf + 24, 8), v1 ? 0 : load_le(buf + 32, 8)};
 }
 
 void RaftStateFile::save(const raft_hard_state& state) {

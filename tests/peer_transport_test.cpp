@@ -423,6 +423,18 @@ static void test_config() {
     // No trailing newline.
     CHECK(ClusterConfig::parse("1 127.0.0.1 7000", 1, "x").nodes().size() == 1);
 
+    // Optional fourth column: the node's client port (for redirects).
+    {
+        const ClusterConfig c4 = ClusterConfig::parse("1 127.0.0.1 6001 5551\n2 127.0.0.1 6002\n", 2, "x");
+        CHECK(c4.address_of(1)->client_port == std::optional<std::uint16_t>(5551));
+        CHECK(!c4.address_of(2)->client_port.has_value());
+        CHECK(c4.address_of(1)->port == 6001);
+    }
+    CHECK(config_rejects("1 127.0.0.1 6001 0\n", 1, "invalid client port"));
+    CHECK(config_rejects("1 127.0.0.1 6001 70000\n", 1, "invalid client port"));
+    CHECK(config_rejects("1 127.0.0.1 6001 5551 9\n", 1, "test.conf:1: expected"));
+    CHECK(config_rejects("1 a 6001 6001\n", 1, "client port reuses address a:6001"));
+    CHECK(config_rejects("1 a 6001 5551\n2 a 5551\n", 1, "reuses address a:5551"));
     CHECK(config_rejects("1 127.0.0.1\n", 1, "test.conf:1: expected"));
     CHECK(config_rejects("1 127.0.0.1 6001\n2 h 6002 extra\n", 1, "test.conf:2:"));
     CHECK(config_rejects("0 127.0.0.1 6001\n", 1, "reserved"));

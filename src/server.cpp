@@ -11,10 +11,35 @@
 
 using asio::ip::tcp;
 
+// A request waiting on Raft gets this long before ERR_TIMEOUT (outcome unknown).
+constexpr std::chrono::seconds kClientRequestTimeout{5};
+
+// Cluster mode: what a session needs to route requests through Raft.
+struct ClusterFrontEnd
+{
+    RaftNode& raft;
+    const ClusterConfig& config;
+
+    // Where to send a client this node can't serve.
+    std::string redirect(const std::string& op) const {
+        const node_id leader = raft.leader_hint();
+        std::string reply;
+        if (leader == 0) {
+            reply = "ERR_NO_LEADER";
+        } else {
+            reply = "REDIRECT " + std::to_string(leader);
+            const auto addr = config.address_of(leader);
+            if (addr && addr->client_port) { reply += " " + addr->host + ":" + std::to_string(*addr->client_port); }
+        }
+        std::cerr << "[client] " << op << " on non-leader node " << config.self_id() << ": " << reply << "\n";
+        return reply;
+    }
+};
+
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    explicit Session(tcp::socket socket)
-        : socket_(std::move(socket)) {}
+    Session(tcp::socket socket, const ClusterFrontEnd* cluster)
+        : socket_(std::move(socket)), cluster_(cluster), timer_(socket_.get_executor()) {}
 
     void start() {
         read();
@@ -29,14 +54,56 @@ private:
                     std::istream is(&buffer_);
                     std::string line;
                     std::getline(is, line);
-
-                    std::string response = process_line(line);
-                    response += "\n";
-
-                    write(response);
-                    std::cout << response;
+                    handle(line);
                 }
             });
+    }
+
+    void respond(std::string response) {
+        response += "\n";
+        write(response);
+        std::cout << response;
+    }
+
+    void handle(const std::string& line) {
+        if (!cluster_) {  // plain mode: answered on the spot, as always
+            respond(process_line(line));
+            return;
+        }
+        const client_request req = parse_request(line);
+        if (req.type == client_request::kind::reply) {
+            respond(req.reply);
+            return;
+        }
+
+        // Reads and writes go to the leader and finish asynchronously: the
+        // reply is sent when Raft completes them (or on timeout), and the
+        // next line isn't read until then.
+        auto self = shared_from_this();
+        waiting_ = true;
+        timer_.expires_after(kClientRequestTimeout);
+        timer_.async_wait([this, self](std::error_code ec) {
+            if (!ec) { finish("ERR_TIMEOUT"); }
+        });
+        bool accepted = false;
+        if (req.type == client_request::kind::write) {
+            accepted = cluster_->raft.propose(req.cmd, [this, self](const raft_outcome& o) {
+                finish(o.type == raft_outcome::kind::applied ? o.result : "ERR_LEADERSHIP_LOST");
+            });
+        } else {
+            accepted = cluster_->raft.read_barrier([this, self, cmd = req.cmd](const raft_outcome& o) {
+                finish(o.type == raft_outcome::kind::applied ? execute_read(cmd) : "ERR_LEADERSHIP_LOST");
+            });
+        }
+        if (!accepted) { finish(cluster_->redirect(req.cmd.operation)); }
+    }
+
+    // First completion wins: Raft's outcome or the timeout.
+    void finish(const std::string& response) {
+        if (!waiting_) { return; }
+        waiting_ = false;
+        timer_.cancel();
+        respond(response);
     }
 
     void write(const std::string& msg) {
@@ -51,12 +118,15 @@ private:
 
     tcp::socket socket_;
     asio::streambuf buffer_;
+    const ClusterFrontEnd* cluster_;  // null in plain mode
+    asio::steady_timer timer_;
+    bool waiting_ = false;
 };
 
 class Server {
 public:
-    Server(asio::io_context& io, std::uint16_t port)
-        : acceptor_(io, tcp::endpoint(tcp::v4(), port)) {
+    Server(asio::io_context& io, std::uint16_t port, const ClusterFrontEnd* cluster)
+        : acceptor_(io, tcp::endpoint(tcp::v4(), port)), cluster_(cluster) {
         accept();
     }
 
@@ -65,13 +135,14 @@ private:
         acceptor_.async_accept(
             [this](std::error_code ec, tcp::socket socket) {
                 if (!ec) {
-                    std::make_shared<Session>(std::move(socket))->start();
+                    std::make_shared<Session>(std::move(socket), cluster_)->start();
                 }
                 accept();
             });
     }
 
     tcp::acceptor acceptor_;
+    const ClusterFrontEnd* cluster_;
 };
 
 static int usage(const char* prog) {
@@ -85,6 +156,7 @@ int main(int argc, char** argv) {
     std::optional<std::string> cluster_path;
     std::optional<std::string> node_id_arg;
     std::uint16_t client_port = 5555;
+    bool client_port_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--cluster" && i + 1 < argc) {
@@ -99,6 +171,7 @@ int main(int argc, char** argv) {
                 return usage(argv[0]);
             }
             client_port = static_cast<std::uint16_t>(port);
+            client_port_given = true;
         } else if (i == 1 && arg.rfind("--", 0) != 0) {
             log_path = arg;
         } else {
@@ -120,12 +193,25 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to load cluster config: " << e.what() << "\n";
             return 1;
         }
+        // The config's client port (if any) is where others redirect clients
+        // to us, so it must be where we actually listen.
+        if (const auto configured = cluster->self_address().client_port) {
+            if (client_port_given && client_port != *configured) {
+                std::cerr << "--client-port " << client_port << " disagrees with the cluster config, which gives node "
+                          << cluster->self_id() << " client port " << *configured << "\n";
+                return 1;
+            }
+            client_port = *configured;
+        }
     }
 
     try {
-        // Rebuild state from the log before accepting any connections.
-        const auto recovered = init_engine(log_path);
-        std::cout << "Replayed " << recovered.last_index << " log entries from " << log_path << "\n";
+        // Rebuild state from the log before accepting any connections. In
+        // cluster mode the log is only loaded here: Raft applies the
+        // committed prefix itself when it starts.
+        const auto recovered = init_engine(log_path, cluster ? 0 : UINT64_MAX);
+        std::cout << "Replayed " << recovered.last_index << " log entries from " << log_path
+                  << (cluster ? " (applying only committed entries, via Raft)" : "") << "\n";
         if (recovered.recovered_tail_bytes > 0) {
             std::cout << "Discarded " << recovered.recovered_tail_bytes
                       << " bytes of incomplete final entry (crash mid-write)\n";
@@ -149,6 +235,7 @@ int main(int argc, char** argv) {
         raft_state.emplace(RaftStateFile::path_for_log(log_path), cluster->self_id());
         raft_options options;
         options.state = &*raft_state;
+        options.apply = [](const log_entry& e) { return apply_command(e.cmd); };
         // Replies slower than the shortest election timeout are stale anyway.
         peer_client.emplace(io, endpoints, kElectionTimeoutMin);
         try {
@@ -169,7 +256,9 @@ int main(int argc, char** argv) {
         raft->start();
     }
 
-    Server server(io, client_port);
+    std::optional<ClusterFrontEnd> front;
+    if (cluster) { front.emplace(ClusterFrontEnd{*raft, *cluster}); }
+    Server server(io, client_port, front ? &*front : nullptr);
     std::cout << "KV server listening on port " << client_port << "\n";
     io.run();
 }

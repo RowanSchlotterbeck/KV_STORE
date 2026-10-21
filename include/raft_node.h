@@ -1,10 +1,18 @@
 #ifndef KV_STORE_RAFT_NODE_H
 #define KV_STORE_RAFT_NODE_H
 
-// Raft leader election, heartbeats and log replication (Raft paper, Figure
-// 2), minus commitment: entries are copied to followers' logs, but there is
-// no commit index, nothing is applied to the state machine, and client
-// writes aren't routed through Raft yet. leader_commit is always 0.
+// Raft (paper, Figure 2): leader election, heartbeats, log replication,
+// commitment and apply, and the client write path into the leader's log.
+// No snapshots/compaction and no linearizable (ReadIndex) reads.
+//
+// Commit: the leader commits the highest index N that a majority (itself
+// included) has stored, but only if its own log has N in the current term;
+// older-term entries are committed only by a current-term entry above them
+// (Figure 8). Every new leader appends a no-op in its term at once, so that
+// happens without waiting for a client write. Followers learn the commit
+// index from leader_commit, capped at the last entry the request covered.
+// Committed entries are applied in index order, exactly once, through the
+// `apply` callback: the only path that changes the state machine.
 //
 // Each heartbeat is a probe plus a batch. The leader keeps nextIndex and
 // matchIndex per follower and sends prev_log_index = nextIndex - 1 with the
@@ -44,6 +52,9 @@
 constexpr std::chrono::milliseconds kElectionTimeoutMin{150};
 constexpr std::chrono::milliseconds kElectionTimeoutMax{300};
 constexpr std::chrono::milliseconds kHeartbeatInterval{50};  // well under kElectionTimeoutMin
+
+// The command a new leader appends in its term; applying it does nothing.
+inline const char* const kNoopOperation = "NOOP";
 
 // Per-AppendEntries batch bounds. A very-behind follower catches up over
 // several heartbeats. The byte bound counts log frames (8-byte header plus
@@ -124,10 +135,26 @@ struct raft_options
     bool log = true;            // human-readable transitions on stderr
     // Called (on the io_context thread) after every role, term or leader change.
     std::function<void(const raft_status&)> on_change;
-    // Durable backing for current_term/voted_for, loaded by the constructor
-    // and must outlive the node. Null keeps them in memory only (unit tests
-    // that don't exercise restarts); the server always sets it.
+    // Durable backing for current_term/voted_for/commit_index, loaded by the
+    // constructor and must outlive the node. Null keeps them in memory only
+    // (unit tests that don't exercise restarts); the server always sets it.
     RaftStateFile* state = nullptr;
+    // Applies one committed entry's command and returns its result for the
+    // client. Called in index order, exactly once per index per process, on
+    // the io_context thread; never for no-ops. Null: nothing to apply (tests).
+    std::function<std::string(const log_entry&)> apply;
+};
+
+// How a client request handed to propose() / read_barrier() ended.
+struct raft_outcome
+{
+    enum class kind
+    {
+        applied,          // write: committed and applied (`result` is the state machine's reply); read: safe to serve
+        lost_leadership,  // stepped down first: a write may or may not commit later
+    };
+    kind type = kind::applied;
+    std::string result;
 };
 
 class RaftNode
@@ -158,6 +185,21 @@ public:
     std::size_t majority() const { return (peers_.size() + 1) / 2 + 1; }
     // Per-follower progress while leader; empty otherwise.
     std::map<node_id, peer_progress> progress() const;
+    std::uint64_t commit_index() const { return commit_index_; }
+    std::uint64_t last_applied() const { return last_applied_; }
+    node_id leader_hint() const { return leader_id_; }  // 0 if unknown
+
+    using outcome_fn = std::function<void(const raft_outcome&)>;
+    // Leader only (else returns false and does nothing): durably appends
+    // `cmd` as a new entry in the current term, starts replicating it, and
+    // calls `done` once it is applied, or with lost_leadership if this node
+    // steps down first. `done` may run before propose() returns (single-node
+    // cluster). Never blocks.
+    bool propose(command cmd, outcome_fn done);
+    // Leader only (else false): calls `done` once this leader has applied
+    // everything committed before its term (its no-op), immediately if it
+    // already has; lost_leadership if it steps down first.
+    bool read_barrier(outcome_fn done);
 
 private:
     void reset_election_timer();
@@ -171,6 +213,13 @@ private:
     // Follower side of AppendEntries once the consistency check has passed.
     void store_entries(const append_entries_request& req);
     void step_down(std::uint64_t new_term, const char* why, node_id from);
+    // Appends one entry in the current term, durably (crash-stops on failure).
+    std::uint64_t append_own(command cmd);
+    void advance_leader_commit();
+    // Durably records a higher commit index, then applies up to it.
+    void set_commit(std::uint64_t index);
+    void apply_committed();
+    void fail_pending(const char* why);
     // Durably records term/vote, then updates the in-memory copy.
     void persist(std::uint64_t term, node_id voted_for);
     void notify();
@@ -189,6 +238,17 @@ private:
     node_id leader_id_ = 0;
     std::set<node_id> votes_;  // granted to us in current_term_ (candidate only)
     std::map<node_id, peer_progress> progress_;  // leader only; reset on every win
+
+    std::uint64_t commit_index_ = 0;   // highest index known committed
+    std::uint64_t last_applied_ = 0;   // highest index applied through options_.apply
+    std::uint64_t term_start_ = 0;     // leader: index of this term's no-op; 0 otherwise
+    struct waiter
+    {
+        std::uint64_t term;  // the term the entry was proposed in
+        bool read;
+        outcome_fn done;
+    };
+    std::multimap<std::uint64_t, waiter> pending_;  // keyed by the index whose apply completes it
 
     asio::steady_timer election_timer_;
     asio::steady_timer heartbeat_timer_;

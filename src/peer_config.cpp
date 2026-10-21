@@ -51,6 +51,13 @@ ClusterConfig::ClusterConfig(node_id self, std::map<node_id, peer_address> nodes
         if (!seen.emplace(addr.host, addr.port).second) {
             throw config_error(who + " reuses address " + addr.host + ":" + std::to_string(addr.port));
         }
+        if (addr.client_port) {
+            if (*addr.client_port == 0) { throw config_error(who + " has client port 0"); }
+            if (!seen.emplace(addr.host, *addr.client_port).second) {
+                throw config_error(who + "'s client port reuses address " + addr.host + ":"
+                                   + std::to_string(*addr.client_port));
+            }
+        }
     }
     if (nodes_.find(self_) == nodes_.end()) {
         throw config_error("this node's id " + std::to_string(self_) + " is not listed in the cluster");
@@ -73,8 +80,8 @@ ClusterConfig ClusterConfig::parse(std::string_view text, node_id self, const st
         if (fields.empty()) { continue; }
 
         const std::string where = source + ":" + std::to_string(line_no) + ": ";
-        if (fields.size() != 3) {
-            throw config_error(where + "expected '<node_id> <host> <peer_port>', got "
+        if (fields.size() != 3 && fields.size() != 4) {
+            throw config_error(where + "expected '<node_id> <host> <peer_port> [<client_port>]', got "
                                + std::to_string(fields.size()) + " field(s)");
         }
         node_id id = 0;
@@ -88,7 +95,16 @@ ClusterConfig ClusterConfig::parse(std::string_view text, node_id self, const st
             throw config_error(where + "invalid peer port '" + std::string(fields[2])
                                + "' (expected 1-65535)");
         }
-        if (!nodes.emplace(id, peer_address{std::string(fields[1]), port}).second) {
+        std::optional<std::uint16_t> client_port;
+        if (fields.size() == 4) {
+            std::uint16_t cp = 0;
+            if (!parse_unsigned(fields[3], cp) || cp == 0) {
+                throw config_error(where + "invalid client port '" + std::string(fields[3])
+                                   + "' (expected 1-65535)");
+            }
+            client_port = cp;
+        }
+        if (!nodes.emplace(id, peer_address{std::string(fields[1]), port, client_port}).second) {
             throw config_error(where + "duplicate node id " + std::to_string(id));
         }
     }

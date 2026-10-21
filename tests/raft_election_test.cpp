@@ -101,11 +101,15 @@ static log_entry fake_entry(std::uint64_t index, std::uint64_t term) {
 }
 
 // An in-memory log as a list of terms: terms[i - 1] is the term of entry i,
-// whose contents are fake_entry(i, terms[i - 1]). Ignores the byte cap
-// (fake entries are tiny); the PersistentLog tests cover it.
+// whose contents are fake_entry(i, terms[i - 1]) unless the entry came in
+// through append() (e.g. a leader's no-op or a client write), which keeps
+// its real command. Ignores the byte cap (fake entries are tiny); the
+// PersistentLog tests cover it.
 struct FakeLog final : RaftLog
 {
     std::vector<std::uint64_t> terms;
+    std::map<std::uint64_t, command> commands;     // appended entries' real commands
+    std::size_t max_batch = SIZE_MAX;              // lower to force one-entry batches
     std::vector<std::vector<log_entry>> appended;  // every append() batch, in order
     std::vector<std::uint64_t> truncations;        // every truncate_from() index, in order
 
@@ -119,20 +123,25 @@ struct FakeLog final : RaftLog
     }
     std::vector<log_entry> entries(std::uint64_t from, std::size_t max_count, std::size_t) const override {
         std::vector<log_entry> out;
-        for (std::uint64_t i = from; i >= 1 && i <= terms.size() && out.size() < max_count; ++i) {
+        for (std::uint64_t i = from; i >= 1 && i <= terms.size() && out.size() < std::min(max_count, max_batch); ++i) {
             out.push_back(fake_entry(i, terms[i - 1]));
+            if (const auto it = commands.find(i); it != commands.end()) { out.back().cmd = it->second; }
         }
         return out;
     }
     void truncate_from(std::uint64_t index) override {
         truncations.push_back(index);
-        if (index >= 1 && index <= terms.size()) { terms.resize(index - 1); }
+        if (index >= 1 && index <= terms.size()) {
+            terms.resize(index - 1);
+            commands.erase(commands.lower_bound(index), commands.end());
+        }
     }
     void append(std::span<const log_entry> batch) override {
         appended.emplace_back(batch.begin(), batch.end());
         for (const auto& e : batch) {
             CHECK(e.index == terms.size() + 1);
             terms.push_back(e.term);
+            commands[e.index] = e.cmd;
         }
     }
     // `index` entries, all in `term`.
@@ -353,10 +362,13 @@ static void test_election_win_n5() {
     CHECK(h.node.role() == raft_role::leader);
     CHECK(h.node.status().leader_id == 1 && h.node.current_term() == 1);
 
-    // Heartbeats go out immediately: empty AppendEntries to every peer.
+    // Heartbeats go out immediately to every peer, carrying the new
+    // leader's no-op (index 8, after the 7 entries it had).
     CHECK(h.client.appends.size() == 4);
     for (const auto& a : h.client.appends) {
-        CHECK(a.req.term == 1 && a.req.leader_id == 1 && a.req.entries.empty());
+        CHECK(a.req.term == 1 && a.req.leader_id == 1 && a.req.prev_log_index == 7);
+        CHECK(a.req.entries.size() == 1 && a.req.entries[0].index == 8 && a.req.entries[0].term == 1
+              && a.req.entries[0].cmd.operation == kNoopOperation);
     }
     // A late grant changes nothing.
     reply_from(3, vote_reply(1, true));
@@ -425,10 +437,11 @@ static void test_term_authority() {
         CHECK(h.await_candidate(6));
     }
     {
-        // Leader gets RequestVote with a higher term: steps down (and may vote).
+        // Leader gets RequestVote with a higher term: steps down (and may vote,
+        // here for a candidate whose log has caught up with our no-op 1@1).
         Harness h(1, {2, 3}, quiet(50ms, 50ms, 20ms));
         make_leader(h);
-        const auto r = h.node.handle_request_vote({3, 2, 0, 0});
+        const auto r = h.node.handle_request_vote({3, 2, 1, 1});
         CHECK(r.vote_granted && r.term == 3);
         CHECK(h.node.role() == raft_role::follower && h.node.status().voted_for == 2);
     }
@@ -553,11 +566,13 @@ static void test_consistency_check() {
 
 // ---- nextIndex / matchIndex (leader side) ----
 
+// Starts the node and grants it votes for `term` until it wins.
 static void make_leader(Harness& h, std::uint64_t term = 1) {
     h.node.start();
     CHECK(h.await_candidate(term));
-    for (auto& v : h.client.votes) {
-        if (v.req.term == term) { v.cb(vote_reply(term, true)); break; }
+    const auto votes = h.client.votes;  // a copy: winning sends more RPCs
+    for (const auto& v : votes) {
+        if (v.req.term == term && h.node.role() == raft_role::candidate) { v.cb(vote_reply(term, true)); }
     }
     CHECK(h.node.role() == raft_role::leader);
 }
@@ -584,18 +599,22 @@ static void test_leader_progress() {
     CHECK(p[2].next_index == 4 && p[2].match_index == 0);
     CHECK(p[3].next_index == 4 && p[3].match_index == 0);
 
-    // The first heartbeats probe nextIndex - 1 = 3 with our term there; still empty.
+    // The first heartbeats probe nextIndex - 1 = 3 with our term there and
+    // carry the no-op the new leader appended at 4; nothing committed yet.
     CHECK(h.client.appends.size() == 2);
     for (const auto& a : h.client.appends) {
         CHECK(a.req.prev_log_index == 3 && a.req.prev_log_term == 1);
-        CHECK(a.req.entries.empty() && a.req.leader_commit == 0 && a.req.term == 1 && a.req.leader_id == 1);
+        CHECK(a.req.entries.size() == 1 && a.req.entries[0].index == 4);
+        CHECK(a.req.leader_commit == 0 && a.req.term == 1 && a.req.leader_id == 1);
     }
 
-    // Success from peer 2 only: matchIndex[2] = 3, nextIndex[2] = 4; peer 3 untouched.
+    // Success from peer 2 only: matchIndex[2] = 3 + 1 sent = 4, nextIndex[2] = 5;
+    // peer 3 untouched. (And with us, a majority has 4: committed.)
     appends_to(h.client, 2).at(0)->cb(append_reply(1, true));
     p = h.node.progress();
-    CHECK(p[2].next_index == 4 && p[2].match_index == 3);
+    CHECK(p[2].next_index == 5 && p[2].match_index == 4);
     CHECK(p[3].next_index == 4 && p[3].match_index == 0);
+    CHECK(h.node.commit_index() == 4);
 
     // A failure that isn't for the current probe can't move anything:
     // here, a duplicate rejection of prev 3 after nextIndex already moved.
@@ -617,7 +636,7 @@ static void test_leader_progress() {
     CHECK(h.node.progress()[3].next_index == 2);
     // An unreachable peer changes nothing.
     appends_to(h.client, 2).back()->cb({rpc_error::connect_failed, {}});
-    CHECK(h.node.progress()[2].next_index == 4 && h.node.progress()[2].match_index == 3);
+    CHECK(h.node.progress()[2].next_index == 5 && h.node.progress()[2].match_index == 4);
 }
 
 // Success advances matchIndex by exactly the entries the answered request
@@ -634,27 +653,28 @@ static void test_success_advances_by_count() {
         seen = static_cast<std::size_t>(call - h.client.appends.data()) + 1;
         return FakeClient::append_call{call->peer, call->req, call->cb};
     };
+    // The leader's log: 5 entries, then its no-op at 6.
     std::size_t seen = 0;
-    const auto a = next_to_2(seen);   // prev 5, no entries
-    CHECK(a.req.prev_log_index == 5 && a.req.entries.empty());
+    const auto a = next_to_2(seen);   // prev 5 + [6]
+    CHECK(a.req.prev_log_index == 5 && a.req.entries.size() == 1 && a.req.entries[0].index == 6);
     a.cb(append_reply(1, false));     // next 6 -> 5
-    const auto b = next_to_2(seen);   // prev 4 + [5]
-    CHECK(b.req.prev_log_index == 4 && b.req.entries.size() == 1 && b.req.entries[0].index == 5);
+    const auto b = next_to_2(seen);   // prev 4 + [5, 6]
+    CHECK(b.req.prev_log_index == 4 && b.req.entries.size() == 2 && b.req.entries[0].index == 5);
     b.cb(append_reply(1, false));     // next 5 -> 4
-    const auto c = next_to_2(seen);   // prev 3 + [4, 5]
-    CHECK(c.req.prev_log_index == 3 && c.req.entries.size() == 2);
+    const auto c = next_to_2(seen);   // prev 3 + [4, 5, 6]
+    CHECK(c.req.prev_log_index == 3 && c.req.entries.size() == 3);
     CHECK(c.req.entries[0].index == 4 && c.req.entries[0].term == 1 && c.req.entries[0].cmd.key == "k4");
-    c.cb(append_reply(1, true));      // match = 3 + 2
+    c.cb(append_reply(1, true));      // match = 3 + 3
     auto p = h.node.progress()[2];
-    CHECK(p.match_index == 5 && p.next_index == 6);
+    CHECK(p.match_index == 6 && p.next_index == 7);
     // A duplicate of an earlier, shorter batch succeeding late: no change.
-    b.cb(append_reply(1, true));      // 4 + 1 = 5: same
-    a.cb(append_reply(1, true));      // 5 + 0 = 5: same
+    b.cb(append_reply(1, true));      // 4 + 2 = 6: same
+    a.cb(append_reply(1, true));      // 5 + 1 = 6: same
     p = h.node.progress()[2];
-    CHECK(p.match_index == 5 && p.next_index == 6);
+    CHECK(p.match_index == 6 && p.next_index == 7);
     // Caught up: the next heartbeat carries no entries.
     const auto d = next_to_2(seen);
-    CHECK(d.req.prev_log_index == 5 && d.req.prev_log_term == 1 && d.req.entries.empty());
+    CHECK(d.req.prev_log_index == 6 && d.req.prev_log_term == 1 && d.req.entries.empty());
 }
 
 // nextIndex never goes below 1, and index 0 always matches, so the walk ends.
@@ -699,13 +719,14 @@ static void test_reply_with_higher_term() {
     for (auto& v : h.client.votes) {
         if (v.req.term == 5) { v.cb(vote_reply(5, true)); break; }
     }
+    // Log now: 3 entries, term 1's no-op at 4; this term's no-op goes at 5.
     CHECK(h.node.role() == raft_role::leader);
-    CHECK(h.node.progress()[3].next_index == 4);
+    CHECK(h.node.progress()[3].next_index == 5);
     to3(append_reply(1, false));
-    CHECK(h.node.progress()[3].next_index == 4 && h.node.role() == raft_role::leader);
+    CHECK(h.node.progress()[3].next_index == 5 && h.node.role() == raft_role::leader);
     // A rejection carrying the same term is just a mismatch, not a step-down.
     appends_to(h.client, 3).back()->cb(append_reply(5, false));
-    CHECK(h.node.role() == raft_role::leader && h.node.progress()[3].next_index == 3);
+    CHECK(h.node.role() == raft_role::leader && h.node.progress()[3].next_index == 4);
 }
 
 // Writes a log file of fake_entry(i, terms[i - 1]) and opens it.
@@ -902,11 +923,12 @@ static std::string describe(const DiskPair::round& r) {
 }
 
 // The backward walk, then the repair, on real PersistentLogs that diverge after index 4:
-//   index:     1 2 3 4 | 5 6 7
-//   leader:    1 1 1 2 | 2 3 3
+//   index:     1 2 3 4 | 5 6 7 8
+//   leader:    1 1 1 2 | 2 3 3 5   (8 is the no-op it appends on winning term 5)
 //   follower:  1 1 1 2 | 4 4
 // nextIndex steps 8 -> 5; the probe at prev 4 matches, the follower deletes
-// its 5..6 and stores the leader's 5..7; then matchIndex = 7 and it stays put.
+// its 5..6 and stores the leader's 5..8; then matchIndex = 8, the no-op (a
+// term-5 entry) is on a majority, so 8 commits, and the follower learns it.
 static void test_walk_back_and_repair() {
     std::puts("test_walk_back_and_repair");
     ::alarm(20);
@@ -919,14 +941,17 @@ static void test_walk_back_and_repair() {
 
     CHECK(d.rounds.size() == 8);
     if (d.rounds.size() == 8) {
-        const std::vector<std::uint64_t> want_next = {7, 6, 5, 8, 8, 8, 8, 8};
-        const std::vector<std::uint64_t> want_match = {0, 0, 0, 7, 7, 7, 7, 7};
-        const std::vector<std::size_t> want_sent = {0, 1, 2, 3, 0, 0, 0, 0};
+        const std::vector<std::uint64_t> want_next = {7, 6, 5, 9, 9, 9, 9, 9};
+        const std::vector<std::uint64_t> want_match = {0, 0, 0, 8, 8, 8, 8, 8};
+        const std::vector<std::size_t> want_sent = {1, 2, 3, 4, 0, 0, 0, 0};
+        const std::vector<std::uint64_t> want_commit = {0, 0, 0, 0, 8, 8, 8, 8};  // leader_commit carried
         for (std::size_t i = 0; i < d.rounds.size(); ++i) {
             CHECK(d.rounds[i].after.next_index == want_next[i] && d.rounds[i].after.match_index == want_match[i]);
-            CHECK(d.rounds[i].req.entries.size() == want_sent[i] && d.rounds[i].req.leader_commit == 0);
+            CHECK(d.rounds[i].req.entries.size() == want_sent[i]);
+            CHECK(d.rounds[i].req.leader_commit == want_commit[i]);
         }
     }
+    CHECK(d.leader->commit_index() == 8 && d.follower->node->commit_index() == 8);
     CHECK(d.converged());
     CHECK(read_file(d.follower->path) == read_file(dir.path / "leader" / "kv.log"));  // byte-identical
     CHECK(d.follower->node->role() == raft_role::follower && d.follower->node->current_term() == 5);
@@ -959,10 +984,11 @@ static void test_batched_catch_up() {
     CHECK(d.converged());
     CHECK(read_file(d.follower->path) == read_file(dir.path / "leader" / "kv.log"));
     CHECK(max_batch == kMaxEntriesPerAppend);
-    CHECK(batches == std::vector<std::size_t>({64, 64, 62}));
-    CHECK(d.leader->progress()[2].match_index == 200 && d.leader->progress()[2].next_index == 201);
+    // 190 behind plus the leader's no-op: 191 entries.
+    CHECK(batches == std::vector<std::size_t>({64, 64, 63}));
+    CHECK(d.leader->progress()[2].match_index == 201 && d.leader->progress()[2].next_index == 202);
     for (std::size_t i = d.rounds.size() - 5; i < d.rounds.size(); ++i) {
-        CHECK(d.rounds[i].resp.success && d.rounds[i].req.entries.empty() && d.rounds[i].follower_last == 200);
+        CHECK(d.rounds[i].resp.success && d.rounds[i].req.entries.empty() && d.rounds[i].follower_last == 201);
     }
 }
 
@@ -1000,7 +1026,7 @@ static void test_batch_byte_cap() {
     std::size_t seen = 0;
     std::vector<std::size_t> stored;
     std::size_t largest_bytes = 0;
-    for (int round = 0; round < 200 && follower.disk.last_index() < 12; ++round) {
+    for (int round = 0; round < 200 && follower.disk.last_index() < 13; ++round) {
         if (!run_until(io, [&] { return !appends_to(client, 2, seen).empty(); }, 1000ms)) { break; }
         const std::size_t upto = client.appends.size();
         for (std::size_t i = seen; i < upto; ++i) {
@@ -1022,8 +1048,364 @@ static void test_batch_byte_cap() {
     std::printf("  stored batches of:");
     for (const auto n : stored) { std::printf(" %zu", n); }
     std::printf(" entries (~300 KB each); largest request %zu bytes of frames, cap %zu\n", largest_bytes, kMaxAppendBytes);
-    CHECK(stored == std::vector<std::size_t>({3, 3, 3, 3}));
+    // The last batch also carries the leader's small no-op (13): it still fits.
+    CHECK(stored == std::vector<std::size_t>({3, 3, 3, 4}));
     CHECK(read_file(follower.path) == read_file(leader_path));
+}
+
+// ---- commit and apply (fake transport) ----
+
+// Records every apply in order, into a real StateMachine.
+struct Applier
+{
+    StateMachine sm;
+    std::vector<std::uint64_t> order;  // indices, in the order applied
+    std::vector<std::uint64_t> terms;  // their terms
+
+    std::function<std::string(const log_entry&)> fn() {
+        return [this](const log_entry& e) {
+            order.push_back(e.index);
+            terms.push_back(e.term);
+            return sm.apply(e.cmd);
+        };
+    }
+};
+
+static raft_options with_apply(raft_options o, Applier& a) {
+    o.apply = a.fn();
+    return o;
+}
+
+// Every call to `peer` since `seen`, copied (`appends` reallocates).
+static std::vector<FakeClient::append_call> calls_to(FakeClient& c, node_id peer, std::size_t& seen) {
+    std::vector<FakeClient::append_call> out;
+    for (std::size_t i = seen; i < c.appends.size(); ++i) {
+        if (c.appends[i].peer == peer) { out.push_back(c.appends[i]); }
+    }
+    seen = c.appends.size();
+    return out;
+}
+
+// Succeeds the latest request to `peer` (the one covering the most entries).
+static void ack_latest(Harness& h, node_id peer, std::uint64_t term) {
+    std::size_t seen = 0;
+    auto calls = calls_to(h.client, peer, seen);
+    CHECK(!calls.empty());
+    if (!calls.empty()) { calls.back().cb(append_reply(term, true)); }
+}
+
+static void test_commit_needs_majority() {
+    std::puts("test_commit_needs_majority");
+    for (const std::size_t n : {3, 5}) {
+        Applier a;
+        std::vector<node_id> peers;
+        for (node_id id = 2; id <= n; ++id) { peers.push_back(id); }
+        Harness h(1, peers, with_apply(quiet(50ms, 50ms, 10s), a));
+        make_leader(h);  // no-op at 1
+        std::optional<raft_outcome> done;
+        CHECK(h.node.propose(command{"PUT", "k", "v"}, [&](const raft_outcome& o) { done = o; }));
+        CHECK(h.node.commit_index() == 0 && !done);
+
+        // Peers ack one by one; the commit lands exactly when a majority
+        // (counting the leader) has index 2: 2 of 3, or 3 of 5.
+        const std::size_t need = h.node.majority() - 1;  // acks besides the leader's own copy
+        for (std::size_t k = 0; k < peers.size(); ++k) {
+            ack_latest(h, peers[k], 1);
+            const bool should = k + 1 >= need;
+            CHECK((h.node.commit_index() == 2) == should);
+            CHECK(done.has_value() == should);
+        }
+        CHECK(done && done->type == raft_outcome::kind::applied && done->result == "OK");
+        CHECK(a.order == std::vector<std::uint64_t>({2}));  // the no-op at 1 is never handed to apply
+        CHECK(h.node.last_applied() == 2 && a.sm.get(command{"GET", "k", std::nullopt}) == "v");
+        std::printf("  %zu nodes: committed index 2 after %zu follower ack(s)\n", n, need);
+    }
+}
+
+// Figure 8: an entry from an earlier term that has reached a majority is NOT
+// committed by that alone; it commits only once an entry from the leader's
+// own term above it does.
+//   leader log:  1@t1  2@t2  | 3@t4 (its no-op on winning term 4)
+static void test_prior_term_entry_not_committed_alone() {
+    std::puts("test_prior_term_entry_not_committed_alone");
+    TempDir dir;
+    RaftStateFile state((dir.path / "leader.raftstate").string(), 1);
+    state.save({3, 0, 0});
+    Applier a;
+    raft_options o = with_apply(quiet(50ms, 50ms, 10s), a);
+    o.state = &state;
+    Harness h(1, {2, 3}, o);
+    h.log.terms = {1, 2};
+    h.log.max_batch = 1;  // one entry per request, so a follower can match 2 without 3
+    make_leader(h, 4);
+    CHECK(h.log.terms == std::vector<std::uint64_t>({1, 2, 4}));
+
+    std::size_t seen = 0;
+    auto first = calls_to(h.client, 2, seen);  // prev 2@2 + [3@4]
+    CHECK(first.size() == 1 && first[0].req.prev_log_index == 2 && first[0].req.entries.size() == 1);
+    first[0].cb(append_reply(4, false));       // follower 2 lacks 2: next 3 -> 2
+    // Heartbeats are 10s apart here; a proposal sends to every peer at once,
+    // which delivers the next probe now (it also appends 4@4, unused).
+    CHECK(h.node.propose(command{"PUT", "later", "x"}, [](const raft_outcome&) {}));
+    auto second = calls_to(h.client, 2, seen);
+    CHECK(!second.empty());
+    const auto probe = second.back();          // prev 1@1 + [2@2]
+    CHECK(probe.req.prev_log_index == 1 && probe.req.entries.size() == 1 && probe.req.entries[0].term == 2);
+    probe.cb(append_reply(4, true));           // follower 2 now has 1..2
+
+    // Index 2 is on a majority (leader + follower 2), but it's from term 2.
+    CHECK(h.node.progress()[2].match_index == 2);
+    CHECK(h.node.commit_index() == 0);
+    CHECK(a.order.empty());
+    std::puts("  index 2 (term 2) on 2 of 3 nodes: not committed");
+
+    // Follower 2 then stores the leader's term-4 no-op at 3: that commits 3,
+    // and with it 2 (and 1), indirectly.
+    h.node.propose(command{"PUT", "again", "y"}, [](const raft_outcome&) {});  // sends now (and appends 5@4)
+    auto third = calls_to(h.client, 2, seen);
+    CHECK(!third.empty() && third.back().req.prev_log_index == 2 && third.back().req.entries[0].index == 3);
+    third.back().cb(append_reply(4, true));
+    CHECK(h.node.commit_index() == 3);
+    CHECK(a.order == std::vector<std::uint64_t>({1, 2}));  // 3 is the no-op: not handed to apply
+    CHECK(a.terms == std::vector<std::uint64_t>({1, 2}));
+    CHECK(state.load().commit_index == 3);
+    std::puts("  index 3 (term 4) on 2 of 3 nodes: commits 3, and 1..2 with it");
+}
+
+// Applies happen in index order, each index once, however replies arrive.
+static void test_apply_in_order_exactly_once() {
+    std::puts("test_apply_in_order_exactly_once");
+    Applier a;
+    Harness h(1, {2, 3}, with_apply(quiet(50ms, 50ms, 10s), a));
+    make_leader(h);
+    std::vector<std::string> results;
+    for (int i = 0; i < 10; ++i) {
+        CHECK(h.node.propose(command{"PUT", "k" + std::to_string(i % 3), "v" + std::to_string(i)},
+                             [&](const raft_outcome& o) { results.push_back(o.result); }));
+    }
+    CHECK(h.node.propose(command{"DEL", "k0", std::nullopt}, [&](const raft_outcome& o) { results.push_back(o.result); }));
+    CHECK(h.node.propose(command{"DEL", "k0", std::nullopt}, [&](const raft_outcome& o) { results.push_back(o.result); }));
+    // Every request ever sent gets a success, newest first, then all again.
+    std::size_t seen = 0;
+    auto all = calls_to(h.client, 2, seen);
+    for (auto it = all.rbegin(); it != all.rend(); ++it) { it->cb(append_reply(1, true)); }
+    for (auto& c : all) { c.cb(append_reply(1, true)); }
+    ack_latest(h, 3, 1);
+    CHECK(h.node.commit_index() == 13 && h.node.last_applied() == 13);
+    std::vector<std::uint64_t> want;
+    for (std::uint64_t i = 2; i <= 13; ++i) { want.push_back(i); }
+    CHECK(a.order == want);  // 2..13 once each, in order (1 is the no-op)
+    CHECK(results.size() == 12);
+    if (results.size() == 12) {
+        CHECK(results[10] == "OK" && results[11] == "NOT_FOUND");  // the second DEL sees the first's effect
+    }
+    CHECK(a.sm.get(command{"GET", "k1", std::nullopt}) == "v7" && a.sm.get(command{"GET", "k2", std::nullopt}) == "v8");
+}
+
+// Followers learn the commit index from leader_commit, capped at the last
+// entry the request covered, never further into a tail it didn't check.
+static void test_follower_learns_commit() {
+    std::puts("test_follower_learns_commit");
+    Applier a;
+    Harness h(1, {2, 3}, with_apply(quiet(10s, 10s), a));
+    h.log.terms = {1, 1, 2, 2};  // 3..4 are a stale term-2 tail the leader doesn't have
+    h.node.start();
+    // Heartbeat from the term-3 leader: matches at 2, carries no entries,
+    // leader_commit 4. Only 1..2 are known to match: commit 2, not 4.
+    auto r = h.node.handle_append_entries({3, 2, 2, 1, {}, 4});
+    CHECK(r.success && h.node.commit_index() == 2);
+    CHECK(a.order == std::vector<std::uint64_t>({1, 2}));
+    // Now the leader sends its 3 (term 3): our 3..4 conflict and are replaced,
+    // and commit moves to 3, never having applied the stale ones.
+    r = h.node.handle_append_entries({3, 2, 2, 1, {fake_entry(3, 3)}, 4});
+    CHECK(r.success && h.node.commit_index() == 3 && h.log.terms == std::vector<std::uint64_t>({1, 1, 3}));
+    CHECK(a.order == std::vector<std::uint64_t>({1, 2, 3}) && a.terms == std::vector<std::uint64_t>({1, 1, 3}));
+    // A lower leader_commit (a stale message) never moves it back.
+    CHECK(h.node.handle_append_entries({3, 2, 3, 3, {}, 1}).success);
+    CHECK(h.node.commit_index() == 3 && h.node.last_applied() == 3);
+    // A rejected request (consistency check fails) teaches nothing.
+    CHECK(!h.node.handle_append_entries({3, 2, 9, 3, {}, 9}).success);
+    CHECK(h.node.commit_index() == 3);
+}
+
+// Losing leadership fails every pending request instead of leaving it waiting.
+static void test_lost_leadership_fails_pending() {
+    std::puts("test_lost_leadership_fails_pending");
+    Applier a;
+    Harness h(1, {2, 3}, with_apply(quiet(50ms, 50ms, 10s), a));
+    // Not leader: nothing accepted, and the hint names who is (once known).
+    CHECK(!h.node.propose(command{"PUT", "k", "v"}, [](const raft_outcome&) { CHECK(false); }));
+    CHECK(!h.node.read_barrier([](const raft_outcome&) { CHECK(false); }));
+    h.node.start();
+    CHECK(h.node.handle_append_entries({1, 3, 0, 0, {}, 0}).success);
+    CHECK(h.node.leader_hint() == 3);
+    CHECK(!h.node.propose(command{"PUT", "k", "v"}, [](const raft_outcome&) { CHECK(false); }));
+
+    // As leader of term 3: a write and a read wait (the no-op isn't committed yet).
+    CHECK(h.await_candidate(2));
+    for (auto& v : h.client.votes) { if (v.req.term == 2) { v.cb(vote_reply(2, true)); break; } }
+    CHECK(h.node.role() == raft_role::leader);
+    std::vector<raft_outcome> outcomes;
+    CHECK(h.node.propose(command{"PUT", "k", "v"}, [&](const raft_outcome& o) { outcomes.push_back(o); }));
+    CHECK(h.node.read_barrier([&](const raft_outcome& o) { outcomes.push_back(o); }));
+    CHECK(outcomes.empty());
+    // A higher term arrives: step down, and both fail at once.
+    std::size_t seen = 0;
+    auto calls = calls_to(h.client, 2, seen);
+    CHECK(!calls.empty());
+    if (!calls.empty()) { calls.back().cb(append_reply(7, false)); }
+    CHECK(h.node.role() == raft_role::follower);
+    CHECK(outcomes.size() == 2);
+    for (const auto& o : outcomes) { CHECK(o.type == raft_outcome::kind::lost_leadership); }
+    CHECK(a.order.empty() && h.node.commit_index() == 0);
+    // Replies to the old term's requests change nothing now.
+    for (auto& c : calls) { c.cb(append_reply(2, true)); }
+    CHECK(h.node.commit_index() == 0 && outcomes.size() == 2);
+}
+
+// A read on a new leader waits until it has applied its own no-op, i.e.
+// everything committed before its term; then it is served at once.
+static void test_read_barrier() {
+    std::puts("test_read_barrier");
+    Applier a;
+    Harness h(1, {2, 3}, with_apply(quiet(50ms, 50ms, 10s), a));
+    make_leader(h);
+    int served = 0;
+    CHECK(h.node.read_barrier([&](const raft_outcome& o) { served += o.type == raft_outcome::kind::applied; }));
+    CHECK(served == 0);
+    ack_latest(h, 2, 1);  // no-op committed and applied
+    CHECK(served == 1);
+    CHECK(h.node.read_barrier([&](const raft_outcome& o) { served += o.type == raft_outcome::kind::applied; }));
+    CHECK(served == 2);   // immediately this time
+}
+
+// ---- restart: apply only what is known committed ----
+
+static void test_restart_applies_only_committed() {
+    std::puts("test_restart_applies_only_committed");
+    TempDir dir;
+    const auto log_path = dir.path / "n2" / "kv.log";
+    write_log_file(log_path, {1, 1, 1, 2, 2});  // 5 entries; only 1..3 known committed
+    RaftStateFile state(RaftStateFile::path_for_log(log_path.string()), 2);
+    state.save({2, 0, 3});
+
+    const auto boot = [&](Applier& a) {
+        auto disk = std::make_unique<PersistentLog>();
+        disk->open(log_path.string());
+        StateMachine unused;
+        CHECK(disk->replay(unused, 0) == disk->last_index());  // loads, applies nothing
+        CHECK(unused.list() == "(empty)");
+        return disk;
+    };
+    {
+        Applier a;
+        auto disk = boot(a);
+        PersistentRaftLog log(*disk);
+        asio::io_context io;
+        FakeClient client;
+        raft_options o = with_apply(quiet(10s, 10s), a);
+        o.state = &state;
+        RaftNode node(io, 2, {1, 3}, client, log, o);
+        node.start();
+        CHECK(a.order == std::vector<std::uint64_t>({1, 2, 3}));  // not 4, 5
+        CHECK(node.commit_index() == 3 && node.last_applied() == 3 && disk->last_index() == 5);
+        CHECK(a.sm.get(command{"GET", "k4", std::nullopt}) == "NOT_FOUND");
+        CHECK(a.sm.get(command{"GET", "k3", std::nullopt}) == "v3t1");
+        // 4..5 are still in the log, so the new leader can match them...
+        CHECK(node.handle_append_entries({3, 1, 5, 2, {}, 4}).success);
+        CHECK(a.order == std::vector<std::uint64_t>({1, 2, 3, 4}));  // ...and commit them
+    }
+    {
+        // Same start, but the new leader has something else at 4: the
+        // uncommitted 4..5 are truncated, and were never applied.
+        state.save({2, 0, 3});
+        write_log_file(log_path, {1, 1, 1, 2, 2});
+        Applier a;
+        auto disk = boot(a);
+        PersistentRaftLog log(*disk);
+        asio::io_context io;
+        FakeClient client;
+        raft_options o = with_apply(quiet(10s, 10s), a);
+        o.state = &state;
+        RaftNode node(io, 2, {1, 3}, client, log, o);
+        node.start();
+        CHECK(node.handle_append_entries({3, 1, 3, 1, {fake_entry(4, 3)}, 4}).success);
+        CHECK(disk->last_index() == 4 && *disk->term_at(4) == 3);
+        CHECK(a.order == std::vector<std::uint64_t>({1, 2, 3, 4}) && a.terms.back() == 3);
+        CHECK(a.sm.get(command{"GET", "k4", std::nullopt}) == "v4t3");  // the leader's 4, not ours
+        CHECK(a.sm.get(command{"GET", "k5", std::nullopt}) == "NOT_FOUND");
+    }
+}
+
+// The commit index on disk never leads the real one: it is saved before the
+// entries it covers are applied, and a crash in between only leaves it
+// behind. A saved value past the end of the log is clamped, not trusted.
+static void test_commit_persistence_is_conservative() {
+    std::puts("test_commit_persistence_is_conservative");
+    TempDir dir;
+    RaftStateFile state((dir.path / "n1.raftstate").string(), 1);
+    // (1) Saved before apply: when entry i is applied, disk already says >= i.
+    {
+        Applier a;
+        raft_options o = with_apply(quiet(50ms, 50ms, 10s), a);
+        o.state = &state;
+        bool ok = true;
+        o.apply = [&](const log_entry& e) {
+            ok = ok && state.load().commit_index >= e.index;
+            return a.sm.apply(e.cmd);
+        };
+        Harness h(1, {2, 3}, o);
+        make_leader(h);
+        for (int i = 0; i < 5; ++i) { h.node.propose(command{"PUT", "k", "v"}, [](const raft_outcome&) {}); }
+        ack_latest(h, 2, 1);
+        CHECK(h.node.commit_index() == 6 && ok && state.load().commit_index == 6);
+    }
+    // (2) A crash after commit but before the save: disk says 2, truth is 5.
+    //     Restart applies 1..2 only, then learns the rest from the leader.
+    {
+        TempDir d2;
+        const auto log_path = d2.path / "kv.log";
+        write_log_file(log_path, {1, 1, 1, 1, 1});
+        RaftStateFile lagging(RaftStateFile::path_for_log(log_path.string()), 2);
+        lagging.save({1, 0, 2});
+        PersistentLog disk;
+        disk.open(log_path.string());
+        StateMachine unused;
+        disk.replay(unused, 0);
+        PersistentRaftLog log(disk);
+        Applier a;
+        asio::io_context io;
+        FakeClient client;
+        raft_options o = with_apply(quiet(10s, 10s), a);
+        o.state = &lagging;
+        RaftNode node(io, 2, {1, 3}, client, log, o);
+        node.start();
+        CHECK(a.order == std::vector<std::uint64_t>({1, 2}));
+        CHECK(node.handle_append_entries({1, 1, 5, 1, {}, 5}).success);
+        CHECK(a.order == std::vector<std::uint64_t>({1, 2, 3, 4, 5}) && lagging.load().commit_index == 5);
+    }
+    // (3) A saved commit index beyond the log (can't happen, but don't trust
+    //     it): clamped to the log's end, nothing invented.
+    {
+        TempDir d3;
+        const auto log_path = d3.path / "kv.log";
+        write_log_file(log_path, {1, 1});
+        RaftStateFile over(RaftStateFile::path_for_log(log_path.string()), 2);
+        over.save({1, 0, 99});
+        PersistentLog disk;
+        disk.open(log_path.string());
+        StateMachine unused;
+        disk.replay(unused, 0);
+        PersistentRaftLog log(disk);
+        Applier a;
+        asio::io_context io;
+        FakeClient client;
+        raft_options o = with_apply(quiet(10s, 10s), a);
+        o.state = &over;
+        RaftNode node(io, 2, {1, 3}, client, log, o);
+        node.start();
+        CHECK(node.commit_index() == 2 && a.order == std::vector<std::uint64_t>({1, 2}));
+    }
 }
 
 // Callbacks that arrive after the node is gone must not touch it.
@@ -1144,12 +1526,13 @@ public:
             state_ = std::make_unique<RaftStateFile>(state_path_, id_);
             opts.state = state_.get();
         }
+        opts.apply = [this](const log_entry& e) { return sm_.apply(e.cmd); };
         RaftLog* log = &fake_log_;
         if (!log_path_.empty()) {
             disk_log_ = std::make_unique<PersistentLog>();
             disk_log_->open(log_path_);
-            StateMachine unused;  // replication never applies; replay needs somewhere to put it
-            disk_log_->replay(unused);
+            StateMachine unused;  // load only: Raft applies the committed prefix itself
+            disk_log_->replay(unused, 0);
             raft_log_ = std::make_unique<PersistentRaftLog>(*disk_log_);
             log = raft_log_.get();
         }
@@ -1182,6 +1565,63 @@ public:
         return result.get_future().get();
     }
 
+    // Runs `fn` on the node's io thread and returns its result.
+    template <typename F>
+    auto on_io(F fn) -> decltype(fn()) {
+        std::promise<decltype(fn())> result;
+        asio::post(io_, [&] { result.set_value(fn()); });
+        return result.get_future().get();
+    }
+
+    struct write_result
+    {
+        bool accepted = false;                // false: not the leader
+        std::optional<raft_outcome> outcome;  // nullopt: timed out waiting
+        node_id leader_hint = 0;
+    };
+
+    // A client write through Raft: propose on the io thread, wait (here, on
+    // the test thread) for its outcome.
+    write_result put(const std::string& key, const std::string& value, std::chrono::milliseconds wait = 3000ms) {
+        return submit(command{"PUT", key, value}, wait);
+    }
+
+    write_result submit(command cmd, std::chrono::milliseconds wait) {
+        auto promised = std::make_shared<std::promise<raft_outcome>>();
+        auto future = promised->get_future();
+        write_result r;
+        on_io([&] {
+            r.accepted = raft_->propose(cmd, [promised](const raft_outcome& o) { promised->set_value(o); });
+            r.leader_hint = raft_->leader_hint();
+            return 0;
+        });
+        if (r.accepted && future.wait_for(wait) == std::future_status::ready) { r.outcome = future.get(); }
+        return r;
+    }
+
+    // A leader read: waits for the read barrier, then reads the state machine.
+    std::optional<std::string> get(const std::string& key, std::chrono::milliseconds wait = 3000ms) {
+        auto promised = std::make_shared<std::promise<std::string>>();
+        auto future = promised->get_future();
+        const bool accepted = on_io([&] {
+            return raft_->read_barrier([this, promised, key](const raft_outcome& o) {
+                promised->set_value(o.type == raft_outcome::kind::applied
+                                        ? sm_.get(command{"GET", key, std::nullopt}) : "ERR_LEADERSHIP_LOST");
+            });
+        });
+        if (!accepted || future.wait_for(wait) != std::future_status::ready) { return std::nullopt; }
+        return future.get();
+    }
+
+    // This node's own store (whatever it has applied), no Raft involved.
+    std::string stored(const std::string& key) {
+        return on_io([&] { return sm_.get(command{"GET", key, std::nullopt}); });
+    }
+    std::string stored_all() { return on_io([&] { return sm_.list(); }); }
+    std::pair<std::uint64_t, std::uint64_t> commit_applied() {
+        return on_io([&] { return std::make_pair(raft_->commit_index(), raft_->last_applied()); });
+    }
+
     // The node's last log index, read on its own io thread.
     std::uint64_t last_index() {
         if (!alive()) { return 0; }
@@ -1195,6 +1635,7 @@ private:
     History& history_;
     std::string state_path_;
     std::string log_path_;
+    StateMachine sm_;  // fed only by Raft's apply
     FakeLog fake_log_;
     std::unique_ptr<PersistentLog> disk_log_;
     std::unique_ptr<PersistentRaftLog> raft_log_;
@@ -1526,8 +1967,13 @@ static void test_cluster3_identical_logs() {
     const std::string seeded = read_file(c.log_path(1));
     const auto a = elect_and_hold(c, "3-node identical logs", 1000ms);
     CHECK(c.history.at_most_one_leader_per_term());
-    // Nothing to ship and nothing to repair: no log was written to.
-    for (node_id id = 1; id <= 3; ++id) { CHECK(read_file(c.log_path(id)) == seeded); }
+    // Nothing to repair: each log keeps its 3 entries untouched and gains
+    // only the leader's no-op, identically.
+    for (node_id id = 1; id <= 3; ++id) {
+        const std::string now = read_file(c.log_path(id));
+        CHECK(now.size() > seeded.size() && now.compare(0, seeded.size(), seeded) == 0);
+        CHECK(now == read_file(c.log_path(1)));
+    }
     if (!a) { return; }
     const auto p = c.node(a->leader).progress();
     CHECK(p.size() == 2);
@@ -1536,7 +1982,7 @@ static void test_cluster3_identical_logs() {
                     static_cast<unsigned long long>(a->leader), static_cast<unsigned long long>(peer),
                     static_cast<unsigned long long>(pr.next_index), static_cast<unsigned long long>(peer),
                     static_cast<unsigned long long>(pr.match_index));
-        CHECK(pr.next_index == 4 && pr.match_index == 3);
+        CHECK(pr.next_index == 5 && pr.match_index == 4);
     }
 }
 
@@ -1591,9 +2037,10 @@ static void test_cluster3_follower_catches_up() {
     std::printf("  node %llu leads term %llu\n", static_cast<unsigned long long>(a->leader),
                 static_cast<unsigned long long>(a->term));
 
-    const auto trace = await_last_index(c, 3, 120, 10000ms);
+    // 120 seeded entries plus the leader's no-op at 121.
+    const auto trace = await_last_index(c, 3, 121, 10000ms);
     std::printf("  node 3 last index: %s\n", join(trace).c_str());
-    CHECK(!trace.empty() && trace.back() == 120);
+    CHECK(!trace.empty() && trace.back() == 121);
 
     // Quiet: no more writes to any log, nobody campaigns, the leader holds.
     const long long t0 = c.history.now_ms();
@@ -1604,7 +2051,7 @@ static void test_cluster3_follower_catches_up() {
     CHECK(files[3] == files[a->leader]);  // byte-identical to the leader
     CHECK(c.history.elections_started_after(t0) == 0);
     const auto p = c.node(a->leader).progress();
-    CHECK(p.at(3).match_index == 120 && p.at(3).next_index == 121);
+    CHECK(p.at(3).match_index == 121 && p.at(3).next_index == 122);
 
     // Crash and restart the follower: its replayed log is still the leader's,
     // and the leader has nothing to send it.
@@ -1612,7 +2059,7 @@ static void test_cluster3_follower_catches_up() {
     const auto b = c.await_agreement(2000ms);
     CHECK(b && b->leader == a->leader && b->term == a->term);
     std::this_thread::sleep_for(300ms);
-    CHECK(c.node(3).last_index() == 120);
+    CHECK(c.node(3).last_index() == 121);
     CHECK(read_file(c.log_path(3)) == files[a->leader]);
     CHECK(c.history.elections_started_after(t0) == 0);
     CHECK(c.history.at_most_one_leader_per_term());
@@ -1637,16 +2084,112 @@ static void test_cluster3_divergent_follower() {
     if (!a) { return; }
     CHECK(a->leader != 3 && a->term >= 4);
 
-    // 12 -> 5 (truncated at 6) -> 10 is the expected path, though the 5 can
-    // be too brief to sample: the same request truncates and appends.
-    const auto trace = await_last_index(c, 3, 10, 5000ms);
+    // 12 -> 5 (truncated at 6) -> 11 (the leader's 10 plus its no-op) is the
+    // expected path, though the 5 can be too brief to sample: the same
+    // request truncates and appends.
+    const auto trace = await_last_index(c, 3, 11, 5000ms);
     std::printf("  node 3 last index: %s\n", join(trace).c_str());
     std::this_thread::sleep_for(300ms);
-    CHECK(c.node(3).last_index() == 10);
+    CHECK(c.node(3).last_index() == 11);
     CHECK(read_file(c.log_path(3)) == read_file(c.log_path(a->leader)));
     write_log_file(dir.path / "want.log", good);
-    CHECK(read_file(c.log_path(3)) == read_file(dir.path / "want.log"));
+    const std::string want = read_file(dir.path / "want.log");
+    CHECK(read_file(c.log_path(3)).compare(0, want.size(), want) == 0);  // the leader's 1..10, then its no-op
     CHECK(c.agreed() && c.agreed()->leader == a->leader);
+    CHECK(c.history.at_most_one_leader_per_term());
+}
+
+// Waits until every live node's store has applied `key` = `want`; returns
+// how long that took, or -1.
+static long long await_everywhere(Cluster& c, const std::string& key, const std::string& want,
+                                  std::chrono::milliseconds deadline) {
+    const auto start = steady::now();
+    while (ms_since(start) < deadline.count()) {
+        bool all = true;
+        for (node_id id = 1; id <= 3; ++id) {
+            if (c.node(id).alive() && c.node(id).stored(key) != want) { all = false; }
+        }
+        if (all) { return ms_since(start); }
+        std::this_thread::sleep_for(2ms);
+    }
+    return -1;
+}
+
+// Client writes end to end over real sockets: to the leader, they commit on a
+// majority, apply everywhere, and read back; to a follower, they're refused
+// with the leader's id. Then the leader dies: committed data survives on the
+// new leader, new writes work, and the old leader comes back and catches up.
+static void test_cluster3_client_writes_and_failover() {
+    std::puts("test_cluster3_client_writes_and_failover");
+    ::alarm(40);
+    TempDir dir;
+    Cluster c(3, {}, dir.path);
+    const auto a = c.await_agreement(3000ms);
+    CHECK(a.has_value());
+    if (!a) { return; }
+    const node_id leader = a->leader;
+    const node_id follower = leader == 1 ? 2 : 1;
+
+    // Non-leader: not accepted, and it names the leader.
+    const auto refused = c.node(follower).put("color", "red");
+    CHECK(!refused.accepted && refused.leader_hint == leader);
+
+    // Leader: OK comes back only once the entry is on a majority and applied.
+    const auto t0 = steady::now();
+    const auto ok = c.node(leader).put("color", "blue");
+    const long long took = ms_since(t0);
+    CHECK(ok.accepted && ok.outcome && ok.outcome->type == raft_outcome::kind::applied && ok.outcome->result == "OK");
+    const auto [commit, applied] = c.node(leader).commit_applied();
+    std::uint64_t best_match = 0;
+    for (const auto& [peer, p] : c.node(leader).progress()) { best_match = std::max(best_match, p.match_index); }
+    CHECK(best_match >= commit && applied == commit);  // a follower already had it when OK was sent
+    CHECK(c.node(leader).stored("color") == "blue");
+    CHECK(c.node(leader).get("color") == std::optional<std::string>("blue"));
+    const long long spread = await_everywhere(c, "color", "blue", 2000ms);
+    CHECK(spread >= 0);
+    std::printf("  PUT color=blue on leader %llu: OK after %lldms (commit %llu, a follower at %llu); "
+                "all 3 stores had it %lldms later\n",
+                static_cast<unsigned long long>(leader), took, static_cast<unsigned long long>(commit),
+                static_cast<unsigned long long>(best_match), spread);
+
+    // More writes, a DEL, and the follower's rejected PUT never applied anywhere.
+    const auto t1 = steady::now();
+    for (int i = 0; i < 5; ++i) {
+        const auto r = c.node(leader).put("k" + std::to_string(i), "v" + std::to_string(i));
+        CHECK(r.outcome && r.outcome->result == "OK");
+    }
+    std::printf("  5 more PUTs, one at a time: %lldms each on average\n", ms_since(t1) / 5);
+    const auto del = c.node(leader).submit(command{"DEL", "k0", std::nullopt}, 3000ms);
+    CHECK(del.outcome && del.outcome->result == "OK");
+    CHECK(await_everywhere(c, "k4", "v4", 2000ms) >= 0 && await_everywhere(c, "k0", "NOT_FOUND", 2000ms) >= 0);
+    const std::string all = c.node(leader).stored_all();
+    for (node_id id = 1; id <= 3; ++id) { CHECK(c.node(id).stored_all() == all); }
+    CHECK(all.find("red") == std::string::npos);
+    std::this_thread::sleep_for(100ms);  // let the last commit index reach every log's state file
+    for (node_id id = 1; id <= 3; ++id) { CHECK(read_file(c.log_path(id)) == read_file(c.log_path(leader))); }
+
+    // Kill the leader. The survivors elect a new one in a later term, which
+    // still has every committed write, and accepts new ones.
+    c.node(leader).kill();
+    const auto b = c.await_agreement(3000ms);
+    CHECK(b && b->leader != leader && b->term > a->term);
+    if (!b) { return; }
+    CHECK(c.node(b->leader).get("color") == std::optional<std::string>("blue"));
+    CHECK(c.node(b->leader).get("k3") == std::optional<std::string>("v3"));
+    CHECK(c.node(b->leader).get("k0") == std::optional<std::string>("NOT_FOUND"));
+    const auto after = c.node(b->leader).put("after", "failover");
+    CHECK(after.outcome && after.outcome->result == "OK");
+    std::printf("  killed leader %llu; node %llu leads term %llu and still reads color=blue, k3=v3; "
+                "new PUT after=failover -> OK\n",
+                static_cast<unsigned long long>(leader), static_cast<unsigned long long>(b->leader),
+                static_cast<unsigned long long>(b->term));
+
+    // The old leader restarts on its disk state: it rebuilds its store from
+    // its committed prefix and catches up on the rest.
+    c.restart(leader);
+    CHECK(await_everywhere(c, "after", "failover", 3000ms) >= 0);
+    CHECK(c.node(leader).stored("color") == "blue");
+    for (node_id id = 1; id <= 3; ++id) { CHECK(c.node(id).stored_all() == c.node(b->leader).stored_all()); }
     CHECK(c.history.at_most_one_leader_per_term());
 }
 
@@ -1669,6 +2212,14 @@ int main() {
     test_walk_back_and_repair();
     test_batched_catch_up();
     test_batch_byte_cap();
+    test_commit_needs_majority();
+    test_prior_term_entry_not_committed_alone();
+    test_apply_in_order_exactly_once();
+    test_follower_learns_commit();
+    test_lost_leadership_fails_pending();
+    test_read_barrier();
+    test_restart_applies_only_committed();
+    test_commit_persistence_is_conservative();
 
     test_cluster3_happy_path();
     test_heartbeats_suppress_elections();
@@ -1681,6 +2232,7 @@ int main() {
     test_cluster3_identical_logs();
     test_cluster3_follower_catches_up();
     test_cluster3_divergent_follower();
+    test_cluster3_client_writes_and_failover();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

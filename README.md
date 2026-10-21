@@ -69,19 +69,40 @@ This produces:
 ./build/kv_client
 ```
 
-With `--cluster <file> --node-id <id>` the server also listens for peer RPCs
-on that node's `peer_port` from the config and takes part in leader election,
-logging role and term changes to stderr. Its Raft `currentTerm`/`votedFor`
-are fsynced to `<log_path>.raftstate` before it acts on them, so a restarted
-node keeps its vote; a corrupt state file stops startup. `--client-port <port>` (default
-5555) lets several nodes share one machine. Without `--cluster` it runs
-single-node, exactly as before.
+With `--cluster <file> --node-id <id>` the server runs as one node of a Raft
+cluster: it listens for peer RPCs on its `peer_port` from the config, takes
+part in leader election, and replicates the leader's log, logging what it
+does to stderr. Client writes are committed through Raft before they are
+answered:
+
+- **Writes** (`PUT`, `DEL`) go to the leader, which appends them to its log
+  in its current term, replicates them, and replies (`OK`, `NOT_FOUND`, ...)
+  only once the entry is committed on a majority and applied.
+- **Reads** (`GET`, `LIST`) are served by the leader from its applied state,
+  once it has applied everything committed before its term. They are not
+  linearizable (no ReadIndex): a leader that has just been deposed without
+  knowing it can serve a stale read.
+- A **non-leader** answers either kind with `REDIRECT <leader_id> <host>:<client_port>`
+  (just `REDIRECT <leader_id>` if the config doesn't list the leader's client
+  port), or `ERR_NO_LEADER` if it doesn't know one.
+- A request in progress when the leader steps down gets `ERR_LEADERSHIP_LOST`;
+  one that waits more than 5s gets `ERR_TIMEOUT`. In both cases a write may
+  or may not have committed: retry it (`PUT` is idempotent; a retried `DEL`
+  may answer `NOT_FOUND`).
+
+Each node keeps `currentTerm`, `votedFor` and its commit index in
+`<log_path>.raftstate`, fsynced before it acts on them, so a restarted node
+keeps its vote and applies only entries known committed; a corrupt state
+file stops startup. Client ports come from the config's optional fourth
+column, or `--client-port <port>` (default 5555; it must agree with the
+config if both are given). Without `--cluster` it runs single-node, exactly
+as before.
 
 ```
 # three terminals
-./build/kv_server data/n1.log --cluster config/cluster.example.conf --node-id 1 --client-port 5551
-./build/kv_server data/n2.log --cluster config/cluster.example.conf --node-id 2 --client-port 5552
-./build/kv_server data/n3.log --cluster config/cluster.example.conf --node-id 3 --client-port 5553
+./build/kv_server data/n1.log --cluster config/cluster.example.conf --node-id 1
+./build/kv_server data/n2.log --cluster config/cluster.example.conf --node-id 2
+./build/kv_server data/n3.log --cluster config/cluster.example.conf --node-id 3
 ```
 
 Or talk to it directly with `nc`:
@@ -166,13 +187,11 @@ round trip, not the engine, is the bottleneck for real client traffic.
 
 ## Known limitations
 
-- Cluster mode elects a leader and copies the leader's log entries to
-  followers (repairing divergent tails), but nothing is committed or
-  applied through Raft yet. Client writes still go straight into the log
-  of whichever node receives them, as term-0 entries, and a node replays
-  (applies) every entry in its log at startup, including replicated ones.
-  A follower far behind catches up one heartbeat per missing index before
-  entries flow.
+- Cluster mode has no log compaction or snapshots (the log grows forever
+  and a restart reads all of it), no membership changes, and no
+  linearizable reads. A follower far behind catches up one heartbeat per
+  missing index before entries flow, and every probe carries entries even
+  while it is being rejected.
 - Every write is fsynced individually (no batching), so
   write throughput is bounded by disk sync latency.
 - No authentication, TLS, or multi-database support.

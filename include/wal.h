@@ -59,11 +59,13 @@ public:
     void close();
     bool is_open() const { return fd_ >= 0; }
 
-    // Applies every complete entry to `sm` in order and returns the last index.
+    // Loads every complete entry and returns the last index, applying to `sm`
+    // (in order) only entries with index <= `apply_through`: all of them by
+    // default; Raft passes 0 and applies committed entries itself.
     // A torn final entry or a zero-filled tail (crash mid-append) is cut off
     // so the next append starts on a clean boundary. A checksum mismatch or
     // other mid-file corruption throws wal_error and leaves the file as is.
-    std::uint64_t replay(StateMachine& sm);
+    std::uint64_t replay(StateMachine& sm, std::uint64_t apply_through = UINT64_MAX);
 
     // Durably appends `cmd` as the next entry (term 0 until Raft assigns terms)
     // and returns its index. Throws wal_error on I/O failure; after a failure

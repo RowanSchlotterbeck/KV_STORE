@@ -28,9 +28,9 @@ namespace
     }
 }
 
-engine_init_result init_engine(const std::string& log_path) {
+engine_init_result init_engine(const std::string& log_path, std::uint64_t apply_through) {
     wal.open(log_path);
-    const std::uint64_t last = wal.replay(state_machine);
+    const std::uint64_t last = wal.replay(state_machine, apply_through);
     return {last, wal.recovered_tail_bytes()};
 }
 
@@ -39,40 +39,59 @@ PersistentLog& engine_log() {
 }
 
 
-// Line protocol front end: parse -> validate arity -> build a command ->
-// (writes: log, then) StateMachine. Reads never touch the log. Response
-// strings match the previous execute()-based implementation exactly; the only
-// addition is ERR_IO when a write can't be persisted.
-std::string process_line(const std::string& line) {
+// Line protocol front end: parse -> validate arity -> build a command.
+// Response strings match the previous execute()-based implementation
+// exactly; the only addition is ERR_IO when a write can't be persisted.
+client_request parse_request(const std::string& line) {
+    using kind = client_request::kind;
     auto args = input_parser(line);
     if (args.empty() || args[0] == "Error") {
-        return "INPUT_ERROR";
+        return {kind::reply, "INPUT_ERROR", {}};
     }
 
     const std::string& op = args[0];
 
     if (op == "EXIT") {
-        return "EXIT";
+        return {kind::reply, "EXIT", {}};
     }
 
     if (op == "PUT") {
-        if (args.size() != 3) { return "ERR_USAGE PUT <key> <value>"; }
-        return log_then_apply(command{op, args[1], args[2]});
+        if (args.size() != 3) { return {kind::reply, "ERR_USAGE PUT <key> <value>", {}}; }
+        return {kind::write, {}, command{op, args[1], args[2]}};
     }
 
     if (op == "GET") {
-        if (args.size() != 2) { return "ERR_USAGE GET <key>"; }
-        return state_machine.get(command{op, args[1], std::nullopt});
+        if (args.size() != 2) { return {kind::reply, "ERR_USAGE GET <key>", {}}; }
+        return {kind::read, {}, command{op, args[1], std::nullopt}};
     }
 
     if (op == "DEL") {
-        if (args.size() != 2) { return "ERR_USAGE DEL <key>"; }
-        return log_then_apply(command{op, args[1], std::nullopt});
+        if (args.size() != 2) { return {kind::reply, "ERR_USAGE DEL <key>", {}}; }
+        return {kind::write, {}, command{op, args[1], std::nullopt}};
     }
 
     if (op == "LIST") {
-        return state_machine.list();
+        return {kind::read, {}, command{op, {}, std::nullopt}};
     }
 
+    return {kind::reply, "ERR_UNKNOWN_CMD", {}};
+}
+
+std::string execute_read(const command& cmd) {
+    return cmd.operation == "LIST" ? state_machine.list() : state_machine.get(cmd);
+}
+
+std::string apply_command(const command& cmd) {
+    return state_machine.apply(cmd);
+}
+
+// Plain mode: reads never touch the log; writes are logged, then applied.
+std::string process_line(const std::string& line) {
+    const client_request req = parse_request(line);
+    switch (req.type) {
+        case client_request::kind::reply: return req.reply;
+        case client_request::kind::read:  return execute_read(req.cmd);
+        case client_request::kind::write: return log_then_apply(req.cmd);
+    }
     return "ERR_UNKNOWN_CMD";
 }

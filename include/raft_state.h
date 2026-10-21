@@ -1,17 +1,27 @@
 #ifndef KV_STORE_RAFT_STATE_H
 #define KV_STORE_RAFT_STATE_H
 
-// Durable Raft term/vote (Raft paper, Figure 2 "persistent state on all
-// servers", minus the log, which PersistentLog owns).
+// Durable Raft hard state: term and vote (Raft paper, Figure 2 "persistent
+// state on all servers", minus the log, which PersistentLog owns), plus the
+// commit index, so a restart applies only what is known committed.
 //
-// One small file per node, rewritten whole on every change:
+// One small file per node, rewritten whole on every change. Version 2:
 //
 //   offset 0   4 bytes          magic "KVRS"
-//   offset 4   u32 little-endian format version (1)
+//   offset 4   u32 little-endian format version (2)
 //   offset 8   u64 little-endian node id that owns the file
 //   offset 16  u64 little-endian current_term
 //   offset 24  u64 little-endian voted_for (0 = none)
-//   offset 32  u32 little-endian CRC32C of bytes [0, 32)
+//   offset 32  u64 little-endian commit_index
+//   offset 40  u32 little-endian CRC32C of bytes [0, 40)
+//
+// Version 1 (36 bytes: no commit_index, CRC at offset 32) still loads, as
+// commit_index 0; the next save writes version 2.
+//
+// The commit index on disk may lag the real one (it is saved after commit
+// advances, and a crash can fall in between) but never leads it: it is only
+// ever saved with a value already known committed. Lagging is safe: restart
+// applies less and learns the rest from the leader.
 //
 // save() writes a temp file, fsyncs it, renames it over the old one and
 // fsyncs the directory, so after a crash the file holds either the previous
@@ -32,13 +42,15 @@ public:
 struct raft_hard_state
 {
     std::uint64_t term = 0;
-    node_id voted_for = 0;  // 0 = none
+    node_id voted_for = 0;          // 0 = none
+    std::uint64_t commit_index = 0;  // highest index known committed (may lag)
 };
 
 class RaftStateFile
 {
 public:
-    static constexpr std::size_t kSize = 36;
+    static constexpr std::size_t kSize = 44;    // version 2
+    static constexpr std::size_t kSizeV1 = 36;
 
     // The state file lives next to the node's command log, so every node
     // (each needs its own log anyway) gets its own: data/n1.log -> data/n1.log.raftstate.
@@ -50,9 +62,9 @@ public:
     // Does not touch the disk.
     RaftStateFile(std::string path, node_id self);
 
-    // Missing file -> {term 0, voted_for none} (first run). A file of the
-    // wrong size, magic, version or checksum, or one written by a different
-    // node id, throws raft_state_error rather than guessing.
+    // Missing file -> all zero (first run). A file of the wrong size, magic,
+    // version or checksum, or one written by a different node id, throws
+    // raft_state_error rather than guessing.
     raft_hard_state load() const;
 
     // Durably replaces the file with `state` before returning. Throws

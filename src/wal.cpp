@@ -87,7 +87,7 @@ void PersistentLog::close() {
     }
 }
 
-std::uint64_t PersistentLog::replay(StateMachine& sm) {
+std::uint64_t PersistentLog::replay(StateMachine& sm, std::uint64_t apply_through) {
     if (!is_open()) { throw wal_error("replay: log not open"); }
     if (replayed_) { throw wal_error("replay: already replayed " + path_); }
 
@@ -163,7 +163,7 @@ std::uint64_t PersistentLog::replay(StateMachine& sm) {
                           + std::to_string(entry.index));
         }
 
-        sm.apply(entry.cmd);
+        if (entry.index <= apply_through) { sm.apply(entry.cmd); }
         last = entry.index;
         last_term = entry.term;
         terms.push_back(entry.term);

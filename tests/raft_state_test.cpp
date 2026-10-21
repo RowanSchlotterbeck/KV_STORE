@@ -58,7 +58,7 @@ static void write_file(const std::string& path, const std::string& bytes) {
 }
 
 static bool same(const raft_hard_state& a, const raft_hard_state& b) {
-    return a.term == b.term && a.voted_for == b.voted_for;
+    return a.term == b.term && a.voted_for == b.voted_for && a.commit_index == b.commit_index;
 }
 
 // What a separate reader (i.e. a restarted process) would find on disk now.
@@ -163,16 +163,42 @@ static void test_save_then_reload() {
 
 static void test_layout() {
     std::puts("test_layout");
-    const std::string img = RaftStateFile::encode(0x0102, {0x0A0B, 0x03});
-    CHECK(img.size() == RaftStateFile::kSize);
+    const std::string img = RaftStateFile::encode(0x0102, {0x0A0B, 0x03, 0x0C0D});
+    CHECK(img.size() == RaftStateFile::kSize && img.size() == 44);
     CHECK(img.substr(0, 4) == "KVRS");
-    CHECK(img[4] == 1 && img[5] == 0 && img[6] == 0 && img[7] == 0);       // version 1, LE
+    CHECK(img[4] == 2 && img[5] == 0 && img[6] == 0 && img[7] == 0);       // version 2, LE
     CHECK(img[8] == 0x02 && img[9] == 0x01);                               // owner, LE
     CHECK(img[16] == 0x0B && img[17] == 0x0A);                             // term, LE
     CHECK(img[24] == 0x03);                                                // voted_for
-    const std::uint32_t crc = crc32c(img.data(), 32);
-    CHECK(static_cast<unsigned char>(img[32]) == (crc & 0xFF));
-    CHECK(static_cast<unsigned char>(img[35]) == (crc >> 24));
+    CHECK(img[32] == 0x0D && img[33] == 0x0C);                             // commit_index, LE
+    const std::uint32_t crc = crc32c(img.data(), 40);
+    CHECK(static_cast<unsigned char>(img[40]) == (crc & 0xFF));
+    CHECK(static_cast<unsigned char>(img[43]) == (crc >> 24));
+}
+
+// A version-1 file (written before the commit index existed) still loads,
+// with commit index 0, and the next save upgrades it.
+static void test_version1_still_loads() {
+    std::puts("test_version1_still_loads");
+    const std::string path = state_path("v1");
+    std::string v1 = RaftStateFile::encode(1, {7, 3, 0}).substr(0, 32);
+    v1[4] = 1;
+    const std::uint32_t crc = crc32c(v1.data(), v1.size());
+    for (int i = 0; i < 4; ++i) { v1.push_back(static_cast<char>((crc >> (8 * i)) & 0xFF)); }
+    CHECK(v1.size() == RaftStateFile::kSizeV1);
+    write_file(path, v1);
+    CHECK(same(on_disk(path, 1), {7, 3, 0}));
+    RaftStateFile f(path, 1);
+    f.save({7, 3, 5});
+    CHECK(fs::file_size(path) == RaftStateFile::kSize && same(on_disk(path, 1), {7, 3, 5}));
+    // A 36-byte file claiming version 2 is not trusted either way.
+    std::string lying = v1;
+    lying[4] = 2;
+    const std::uint32_t lcrc = crc32c(lying.data(), 32);
+    for (int i = 0; i < 4; ++i) { lying[32 + i] = static_cast<char>((lcrc >> (8 * i)) & 0xFF); }
+    write_file(path, lying);
+    const auto err = load_error(path, 1);
+    CHECK(err && err->find("unsupported version 2 in a 36-byte file") != std::string::npos);
 }
 
 static void test_corrupt_refuses_to_start() {
@@ -184,21 +210,21 @@ static void test_corrupt_refuses_to_start() {
     std::string flipped_term = good;     flipped_term[16] ^= 0x01;
     std::string flipped_crc = good;      flipped_crc[33] ^= 0x80;
     std::string bad_magic = good;        bad_magic[0] = 'X';
-    // A well-formed file for version 2: the CRC is right, the version isn't.
-    std::string v2 = good.substr(0, 32); v2[4] = 2;
-    const std::uint32_t v2crc = crc32c(v2.data(), v2.size());
-    for (int i = 0; i < 4; ++i) { v2.push_back(static_cast<char>((v2crc >> (8 * i)) & 0xFF)); }
+    // A well-formed file for version 3: the CRC is right, the version isn't.
+    std::string v3 = good.substr(0, 40); v3[4] = 3;
+    const std::uint32_t v3crc = crc32c(v3.data(), v3.size());
+    for (int i = 0; i < 4; ++i) { v3.push_back(static_cast<char>((v3crc >> (8 * i)) & 0xFF)); }
 
     const std::vector<variant> variants = {
         {"empty", "", "size is 0 bytes"},
-        {"truncated", good.substr(0, good.size() - 1), "size is 35 bytes"},
+        {"truncated", good.substr(0, good.size() - 1), "size is 43 bytes"},
         {"half", good.substr(0, 16), "size is 16 bytes"},
-        {"oversized", good + '\0', "size is over 36 bytes"},
+        {"oversized", good + '\0', "size is over 44 bytes"},
         {"zeroed", std::string(good.size(), '\0'), "bad magic"},
         {"flipped term bit", flipped_term, "checksum mismatch"},
         {"flipped crc bit", flipped_crc, "checksum mismatch"},
         {"bad magic", bad_magic, "bad magic"},
-        {"future version", v2, "unsupported version 2"},
+        {"future version", v3, "unsupported version 3"},
         {"other node's file", RaftStateFile::encode(2, {5, 2}), "written by node 2, but this is node 1"},
     };
     for (const auto& v : variants) {
@@ -384,6 +410,7 @@ int main() {
     test_first_run_defaults();
     test_save_then_reload();
     test_layout();
+    test_version1_still_loads();
     test_corrupt_refuses_to_start();
     test_save_failure_latches();
     test_vote_survives_restart();

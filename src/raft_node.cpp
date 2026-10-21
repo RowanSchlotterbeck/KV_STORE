@@ -48,6 +48,9 @@ RaftNode::RaftNode(asio::io_context& io, node_id self, std::vector<node_id> peer
         const raft_hard_state saved = options_.state->load();
         current_term_ = saved.term;
         voted_for_ = saved.voted_for;
+        // Committed entries are never truncated, so the log can't be shorter
+        // than a commit index saved from it; clamp anyway rather than trust it.
+        commit_index_ = std::min(saved.commit_index, log_.last().last_index);
     }
 }
 
@@ -87,8 +90,13 @@ void RaftNode::start() {
         options_.election_timeout_max.count(), "ms, heartbeat ", options_.heartbeat_interval.count(), "ms");
     if (options_.state) {
         log("persistent state ", options_.state->path(), ": term ", current_term_, ", voted for ",
-            voted_for_ != 0 ? "node " + std::to_string(voted_for_) : std::string("none"));
+            voted_for_ != 0 ? "node " + std::to_string(voted_for_) : std::string("none"),
+            ", commit index ", commit_index_, " (log has ", log_.last().last_index, ")");
     }
+    // Rebuild the state machine from committed entries only; anything after
+    // commit_index stays in the log, unapplied, until it is committed (or
+    // truncated by a leader).
+    apply_committed();
     notify();
     reset_election_timer();
 }
@@ -180,8 +188,137 @@ void RaftNode::become_leader() {
     election_timer_.cancel();
     log("WON ELECTION with ", votes_.size(), "/", peers_.size() + 1,
         " votes; now leader, sending heartbeats");
+    // A no-op in our term: once it commits, so has everything before it, and
+    // we have applied all of it (reads wait for that; see read_barrier).
+    term_start_ = append_own(command{kNoopOperation, {}, std::nullopt});
+    log("appended no-op at index ", term_start_);
     notify();
+    advance_leader_commit();  // a single-node cluster commits it at once
     send_heartbeats();
+}
+
+std::uint64_t RaftNode::append_own(command cmd) {
+    const log_entry entry{log_.last().last_index + 1, current_term_, std::move(cmd)};
+    try {
+        log_.append(std::span<const log_entry>(&entry, 1));
+    } catch (const wal_error& e) {
+        // Our own copy counts toward the majority, so it must be on disk.
+        std::cerr << "[raft node " << self_ << "] FATAL: cannot append to my log: " << e.what() << "\n";
+        std::abort();
+    }
+    return entry.index;
+}
+
+bool RaftNode::propose(command cmd, outcome_fn done) {
+    if (role_ != raft_role::leader) { return false; }
+    const std::string op = cmd.operation;
+    const std::uint64_t index = append_own(std::move(cmd));
+    log("client ", op, ": appended at index ", index, " in term ", current_term_, "; replicating");
+    pending_.emplace(index, waiter{current_term_, false, std::move(done)});
+    advance_leader_commit();  // single-node cluster: commits (and may complete `done`) here
+    send_heartbeats();        // ship it now rather than at the next heartbeat
+    return true;
+}
+
+bool RaftNode::read_barrier(outcome_fn done) {
+    if (role_ != raft_role::leader) { return false; }
+    if (last_applied_ >= term_start_) {
+        done({raft_outcome::kind::applied, {}});
+    } else {
+        pending_.emplace(term_start_, waiter{current_term_, true, std::move(done)});
+    }
+    return true;
+}
+
+// ---- commit and apply ----
+
+void RaftNode::advance_leader_commit() {
+    if (role_ != raft_role::leader) { return; }
+    // Our own last index counts as our match. The majority()-th largest match
+    // is the highest index a majority holds.
+    std::vector<std::uint64_t> matches{log_.last().last_index};
+    for (const auto& [peer, p] : progress_) { matches.push_back(p.match_index); }
+    std::sort(matches.begin(), matches.end(), std::greater<>());
+    const std::uint64_t n = matches[majority() - 1];
+    if (n <= commit_index_) { return; }
+    // Figure 8: only an entry from our own term may be committed by counting
+    // replicas. Terms never decrease along a log, so if n's term is older,
+    // every index below it is older too and there is nothing to commit yet;
+    // those entries commit indirectly once one of ours above them does.
+    const std::optional<std::uint64_t> term = log_.term_at(n);
+    if (!term || *term != current_term_) {
+        log("index ", n, " is on a majority but from term ", term.value_or(0),
+            "; not committing it until an entry from term ", current_term_, " is");
+        return;
+    }
+    set_commit(n);
+}
+
+void RaftNode::set_commit(std::uint64_t index) {
+    if (index <= commit_index_) { return; }
+    if (options_.state) {
+        try {
+            options_.state->save({current_term_, voted_for_, index});
+        } catch (const raft_state_error& e) {
+            std::cerr << "[raft node " << self_ << "] FATAL: cannot persist commit index " << index
+                      << ": " << e.what() << "\n";
+            std::abort();
+        }
+    }
+    log("commitIndex ", commit_index_, " -> ", index);
+    commit_index_ = index;
+    apply_committed();
+}
+
+void RaftNode::apply_committed() {
+    while (last_applied_ < commit_index_) {
+        std::vector<log_entry> batch;
+        try {
+            batch = log_.entries(last_applied_ + 1, std::min<std::uint64_t>(commit_index_ - last_applied_, 64),
+                                 SIZE_MAX);
+        } catch (const wal_error& e) {
+            std::cerr << "[raft node " << self_ << "] FATAL: cannot read committed entry "
+                      << last_applied_ + 1 << ": " << e.what() << "\n";
+            std::abort();
+        }
+        if (batch.empty() || batch.front().index != last_applied_ + 1) {
+            std::cerr << "[raft node " << self_ << "] FATAL: committed entry " << last_applied_ + 1
+                      << " missing from my log\n";
+            std::abort();
+        }
+        for (const log_entry& e : batch) {
+            std::string result;
+            if (e.cmd.operation == kNoopOperation) {
+                log("applied ", e.index, " (no-op, term ", e.term, ")");
+            } else {
+                if (options_.apply) { result = options_.apply(e); }
+                log("applied ", e.index, " (", e.cmd.operation, ", term ", e.term, ") -> ", result);
+            }
+            last_applied_ = e.index;
+
+            // Complete whoever waits on this index. A write whose slot now
+            // holds another term's entry was overwritten: it never committed.
+            auto [first, last] = pending_.equal_range(e.index);
+            std::vector<waiter> done;
+            for (auto it = first; it != last; ++it) { done.push_back(std::move(it->second)); }
+            pending_.erase(first, last);
+            for (auto& w : done) {
+                if (w.read || w.term == e.term) {
+                    w.done({raft_outcome::kind::applied, w.read ? std::string() : result});
+                } else {
+                    w.done({raft_outcome::kind::lost_leadership, {}});
+                }
+            }
+        }
+    }
+}
+
+void RaftNode::fail_pending(const char* why) {
+    if (pending_.empty()) { return; }
+    log("failing ", pending_.size(), " pending client request(s): ", why);
+    auto failed = std::move(pending_);
+    pending_.clear();
+    for (auto& [index, w] : failed) { w.done({raft_outcome::kind::lost_leadership, {}}); }
 }
 
 // ---- heartbeats ----
@@ -190,7 +327,7 @@ void RaftNode::send_heartbeats() {
     if (role_ != raft_role::leader) { return; }
     for (const node_id peer : peers_) {
         // Per-follower probe at nextIndex - 1, plus our entries from nextIndex
-        // on (none if the follower is caught up). leader_commit stays 0.
+        // on (none if the follower is caught up), plus our commit index.
         peer_progress& p = progress_[peer];
         std::optional<std::uint64_t> prev_term = log_.term_at(p.next_index - 1);
         if (!prev_term) {
@@ -199,7 +336,8 @@ void RaftNode::send_heartbeats() {
             p.next_index = log_.last().last_index + 1;
             prev_term = log_.term_at(p.next_index - 1);
         }
-        append_entries_request req{current_term_, self_, p.next_index - 1, prev_term.value_or(0), {}, 0};
+        append_entries_request req{current_term_, self_, p.next_index - 1, prev_term.value_or(0), {},
+                                   commit_index_};
         try {
             req.entries = log_.entries(p.next_index, kMaxEntriesPerAppend, kMaxAppendBytes);
         } catch (const wal_error& e) {
@@ -240,6 +378,7 @@ void RaftNode::on_heartbeat_reply(node_id peer, std::uint64_t sent_term, std::ui
         if (matched > p.match_index) {
             log("matchIndex[", peer, "] ", p.match_index, " -> ", matched);
             p.match_index = matched;
+            advance_leader_commit();
         }
         p.next_index = p.match_index + 1;
         return;
@@ -274,6 +413,8 @@ void RaftNode::step_down(std::uint64_t new_term, const char* why, node_id from) 
     const std::string role_change = old_role != raft_role::follower
         ? std::string(", ") + to_string(old_role) + " -> follower" : std::string();
     log("saw term ", new_term, " in ", why, source, ": term ", old_term, " -> ", new_term, role_change);
+    term_start_ = 0;
+    fail_pending("lost leadership");
     notify();
     // Followers and candidates already have an election timer running; a
     // leader had none, so it needs one now or it would never time out.
@@ -284,7 +425,7 @@ void RaftNode::persist(std::uint64_t term, node_id voted_for) {
     if (term == current_term_ && voted_for == voted_for_) { return; }  // e.g. a repeat vote for the same candidate
     if (options_.state) {
         try {
-            options_.state->save({term, voted_for});
+            options_.state->save({term, voted_for, commit_index_});
         } catch (const raft_state_error& e) {
             // Continuing would mean sending or replying on a term/vote a
             // restart could forget, which is exactly how double votes happen.
@@ -372,6 +513,12 @@ append_entries_response RaftNode::handle_append_entries(const append_entries_req
         }
     }
     store_entries(req);  // on disk before success is returned
+    // The leader's commit index, capped at the last entry this request
+    // covered: entries past that may be a stale tail the leader hasn't
+    // checked yet, so they can't be assumed to match its committed ones.
+    if (req.leader_commit > commit_index_) {
+        set_commit(std::min<std::uint64_t>(req.leader_commit, req.prev_log_index + req.entries.size()));
+    }
     return {current_term_, true};
 }
 
