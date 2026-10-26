@@ -56,13 +56,6 @@ std::string execute(
 
         return map.erase(args[1]) ? "OK" : "NOT_FOUND";
 
-    } else if (command == "LIST")
-    {
-        std::string out;
-        for (auto& [k, v] : map)
-            out += k + " => " + v + "\n";
-
-        return out.empty() ? "(empty)" : out;
     } else if  (command == "EXIT")
     {
         return "EXIT";

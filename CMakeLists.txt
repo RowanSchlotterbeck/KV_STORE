@@ -3,10 +3,57 @@ project(KV_STORE)
 
 set(CMAKE_CXX_STANDARD 20)
 
+include(cmake/protobuf.cmake)
+
+# --- Protobuf generated code (serialization boundary only) ---
+set(KV_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/proto/kvstore.proto)
+set(KV_PROTO_OUT ${CMAKE_CURRENT_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${KV_PROTO_OUT})
+add_custom_command(
+        OUTPUT ${KV_PROTO_OUT}/kvstore.pb.cc ${KV_PROTO_OUT}/kvstore.pb.h
+        COMMAND $<TARGET_FILE:protobuf::protoc>
+                --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+                --cpp_out=${KV_PROTO_OUT}
+                ${KV_PROTO_SRC}
+        DEPENDS ${KV_PROTO_SRC} protobuf::protoc
+        COMMENT "Generating C++ from kvstore.proto"
+        VERBATIM
+)
+
+set(KV_RAFT_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto)
+add_custom_command(
+        OUTPUT ${KV_PROTO_OUT}/raft.pb.cc ${KV_PROTO_OUT}/raft.pb.h
+        COMMAND $<TARGET_FILE:protobuf::protoc>
+                --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+                --cpp_out=${KV_PROTO_OUT}
+                ${KV_RAFT_PROTO_SRC}
+        DEPENDS ${KV_RAFT_PROTO_SRC} ${KV_PROTO_SRC} protobuf::protoc
+        COMMENT "Generating C++ from raft.proto"
+        VERBATIM
+)
+
+add_library(kv_proto STATIC
+        ${KV_PROTO_OUT}/kvstore.pb.cc
+        ${KV_PROTO_OUT}/raft.pb.cc
+)
+target_include_directories(kv_proto PUBLIC ${KV_PROTO_OUT})
+target_link_libraries(kv_proto PUBLIC protobuf::libprotobuf)
+
 add_library(kv_core
         src/kv_store.cpp
         src/parser.cpp
         src/engine.cpp
+        src/serialization.cpp
+        src/wal.cpp
+        src/crc32c.cpp
+        src/durable_io.cpp
+        src/raft_convert.cpp
+        src/rpc_frame.cpp
+        src/peer_config.cpp
+        src/peer_transport.cpp
+        src/raft_node.cpp
+        src/raft_state.cpp
+        src/status_server.cpp
 )
 
 target_include_directories(kv_core PRIVATE
@@ -21,12 +68,10 @@ target_compile_definitions(kv_core PRIVATE
 )
 
 find_package(Threads REQUIRED)
-target_link_libraries(kv_core PRIVATE Threads::Threads)
+target_link_libraries(kv_core PRIVATE Threads::Threads kv_proto)
 
 add_executable(kv_server
         src/server.cpp
-        src/wal.cpp
-        include/wal.h
 )
 
 target_link_libraries(kv_server PRIVATE kv_core)
@@ -75,4 +120,143 @@ target_compile_definitions(kv_bench_network PRIVATE
         ASIO_STANDALONE
 )
 
+# --- Tests ---
+enable_testing()
 
+add_executable(kv_serialization_test
+        tests/serialization_test.cpp
+)
+
+target_link_libraries(kv_serialization_test PRIVATE kv_core kv_proto)
+
+target_include_directories(kv_serialization_test PRIVATE
+        include
+)
+
+add_test(NAME serialization COMMAND kv_serialization_test)
+
+add_executable(kv_parser_test
+        tests/parser_test.cpp
+)
+
+target_link_libraries(kv_parser_test PRIVATE kv_core)
+
+target_include_directories(kv_parser_test PRIVATE
+        include
+        /opt/homebrew/opt/asio/include
+)
+
+add_test(NAME parser COMMAND kv_parser_test)
+
+add_executable(kv_wal_test
+        tests/wal_test.cpp
+)
+
+target_link_libraries(kv_wal_test PRIVATE kv_core)
+
+target_include_directories(kv_wal_test PRIVATE
+        include
+)
+
+add_test(NAME wal COMMAND kv_wal_test)
+
+add_executable(kv_raft_messages_test
+        tests/raft_messages_test.cpp
+)
+
+target_link_libraries(kv_raft_messages_test PRIVATE kv_core kv_proto)
+
+target_include_directories(kv_raft_messages_test PRIVATE
+        include
+)
+
+add_test(NAME raft_messages COMMAND kv_raft_messages_test)
+
+add_executable(kv_peer_transport_test
+        tests/peer_transport_test.cpp
+)
+
+target_link_libraries(kv_peer_transport_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_peer_transport_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_peer_transport_test PRIVATE
+        ASIO_STANDALONE
+)
+
+add_test(NAME peer_transport COMMAND kv_peer_transport_test)
+# Backstop: a hung network test fails instead of stalling the suite.
+set_tests_properties(peer_transport PROPERTIES TIMEOUT 60)
+
+add_executable(kv_raft_election_test
+        tests/raft_election_test.cpp
+)
+
+target_link_libraries(kv_raft_election_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_raft_election_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_raft_election_test PRIVATE
+        ASIO_STANDALONE
+)
+
+add_test(NAME raft_election COMMAND kv_raft_election_test)
+set_tests_properties(raft_election PROPERTIES TIMEOUT 120)
+
+add_executable(kv_raft_state_test
+        tests/raft_state_test.cpp
+)
+
+target_link_libraries(kv_raft_state_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_raft_state_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_raft_state_test PRIVATE
+        ASIO_STANDALONE
+)
+
+add_test(NAME raft_state COMMAND kv_raft_state_test)
+set_tests_properties(raft_state PROPERTIES TIMEOUT 60)
+
+
+add_executable(kv_status_server_test
+        tests/status_server_test.cpp
+)
+
+target_link_libraries(kv_status_server_test PRIVATE kv_core Threads::Threads)
+
+target_include_directories(kv_status_server_test PRIVATE
+        include
+        network
+        /opt/homebrew/opt/asio/include
+)
+
+target_compile_definitions(kv_status_server_test PRIVATE
+        ASIO_STANDALONE
+)
+
+# Runs real kv_server nodes, so it needs the server built first.
+add_dependencies(kv_status_server_test kv_server)
+add_test(NAME status_server COMMAND kv_status_server_test $<TARGET_FILE:kv_server>)
+set_tests_properties(status_server PROPERTIES TIMEOUT 120)
+
+# Runs kv_client against fake servers, so it needs the client built first.
+add_executable(kv_client_test
+        tests/client_test.cpp
+)
+
+add_dependencies(kv_client_test kv_client)
+add_test(NAME client COMMAND kv_client_test $<TARGET_FILE:kv_client>)
+set_tests_properties(client PROPERTIES TIMEOUT 120)
