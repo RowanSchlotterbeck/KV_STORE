@@ -231,6 +231,80 @@ share of per-command engine cost. The much larger gap between in-process
 and network numbers shows the current single connection/synchronous
 round trip, not the engine, is the bottleneck for real client traffic.
 
+### Fault tolerance (`bench/fault_tolerance.py`)
+
+A Python harness (standard library only) that runs a real cluster of
+`kv_server` processes in a temp dir, with a generated config and ports the
+OS hands out, and SIGKILLs every node it started when it exits.
+
+```
+python3 -I bench/fault_tolerance.py build/kv_server            # both parts, 3 nodes
+python3 -I bench/fault_tolerance.py build/kv_server --quick    # 5 trials, 15s of chaos
+python3 -I bench/fault_tolerance.py build/kv_server chaos --nodes 5 --chaos-seconds 120 --seed 42
+```
+
+It exits 0 on success, 1 if an invariant is violated (the message names the
+key and value involved), and 2 if the harness itself can't run (e.g. no
+leader emerges). `--help` lists every option.
+
+- **Failover time (Part A).** A writer sends PUTs with unique keys to the
+  leader; the harness SIGKILLs the leader, then measures the time until the
+  first write *sent after the kill* is acknowledged, and checks via `/status`
+  that a new leader in a higher term took over. The killed node is restarted
+  and the cluster settles before the next trial. This is bounded below by the
+  election timeout (150–300ms, randomized): followers only notice the leader
+  is gone once their timer fires. It also includes the election, the new
+  leader's no-op and the write's own commit. The tail is a second election:
+  in the 3-node run below, the 4 slowest trials (403–568ms) are exactly the 4
+  whose term advanced by 2 (the first election failed and timed out again).
+  Every trial won by the first election finished within 316ms.
+- **No lost writes under chaos (Part B).** Writers keep sending PUTs while a
+  chaos loop SIGKILLs and restarts nodes, and SIGSTOPs then SIGCONTs them, with
+  at most ⌊(N−1)/2⌋ faulty at a time so a majority can always make progress.
+  SIGSTOP stands in for an unreachable node: the kernel still accepts TCP
+  connections, but the process reads and answers nothing until SIGCONT. Once
+  per run, a majority is frozen for 8s with the leader left alone; no write
+  sent during that phase may be acknowledged.
+
+Each write ends in exactly one outcome, and only `OK` counts as
+acknowledged:
+
+| Reply | Outcome |
+|---|---|
+| `OK` | **acknowledged**: must be present, with its value, at the end |
+| `REDIRECT <id>` | not an outcome: resend to that node |
+| `ERR_NO_LEADER`, connection refused | not acknowledged (never proposed): retry the same write |
+| `ERR_LEADERSHIP_LOST`, `ERR_TIMEOUT`, connection dropped or no reply within 3s | **ambiguous**: may or may not have committed; counted, never asserted either way |
+
+Reads aren't linearizable, so nothing is read back until faults have stopped
+and every node agrees on the leader, term and a fully applied commit index.
+Then every acknowledged write is read back from the leader. Followers answer
+`GET` with `REDIRECT`, so to check for divergence the harness reads every
+node's log file instead: the committed entries `1..commit_index` must be
+identical on all nodes, and replaying them must produce every acknowledged
+value and no key the harness never wrote.
+
+Measured on this machine (macOS, Apple Silicon), default settings:
+
+```
+3 nodes, 50 trials
+  failover time (leader SIGKILL -> first acknowledged write):
+    min 187.5  p50 247.5  p90 303.3  p99 532.8  max 568.2 ms  (mean 264.2)
+  1122 acknowledged, 50 ambiguous, 0 lost; committed logs identical on all 3 nodes
+3 nodes, 60s of chaos
+  faults injected: 8 kill+restart, 12 freeze+thaw (SIGSTOP/SIGCONT), 1 majority-frozen phase
+  RESULT: 1284 acknowledged writes, 0 lost, 0 divergence across 21 injected faults
+5 nodes, 20 trials + 60s of chaos
+  failover: min 217.2  p50 277.3  p90 310.2  p99 324.5  max 327.0 ms
+  RESULT: 872 acknowledged writes, 0 lost, 0 divergence across 38 injected faults
+```
+
+After chaos stops, it can take 25–50s before every node agrees. A follower
+that fell far behind (e.g. restarted early in the run) finds the point where
+its log matches the leader's by stepping back one index per heartbeat, and
+each new leader starts that search over from the end of its own log. The
+harness waits up to `--converge-timeout` (180s) and prints the time taken.
+
 ## Known limitations
 
 - Cluster mode has no log compaction or snapshots (the log grows forever
