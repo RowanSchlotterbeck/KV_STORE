@@ -1294,7 +1294,7 @@ static void test_restart_applies_only_committed() {
         disk->open(log_path.string());
         StateMachine unused;
         CHECK(disk->replay(unused, 0) == disk->last_index());  // loads, applies nothing
-        CHECK(unused.list() == "(empty)");
+        CHECK(unused.size() == 0);
         return disk;
     };
     {
@@ -1617,7 +1617,7 @@ public:
     std::string stored(const std::string& key) {
         return on_io([&] { return sm_.get(command{"GET", key, std::nullopt}); });
     }
-    std::string stored_all() { return on_io([&] { return sm_.list(); }); }
+    std::size_t stored_count() { return on_io([&] { return sm_.size(); }); }
     std::pair<std::uint64_t, std::uint64_t> commit_applied() {
         return on_io([&] { return std::make_pair(raft_->commit_index(), raft_->last_applied()); });
     }
@@ -2119,6 +2119,19 @@ static long long await_everywhere(Cluster& c, const std::string& key, const std:
 // majority, apply everywhere, and read back; to a follower, they're refused
 // with the leader's id. Then the leader dies: committed data survives on the
 // new leader, new writes work, and the old leader comes back and catches up.
+// The nodes' stores match `reference`'s: the same number of keys, and the
+// same value (or NOT_FOUND) for each of `keys`. With `keys` covering every
+// key the reference holds, that makes the stores identical.
+static bool same_stores(Cluster& c, const std::vector<node_id>& nodes, node_id reference,
+                        const std::vector<std::string>& keys) {
+    bool same = true;
+    for (const node_id id : nodes) {
+        same = same && c.node(id).stored_count() == c.node(reference).stored_count();
+        for (const auto& k : keys) { same = same && c.node(id).stored(k) == c.node(reference).stored(k); }
+    }
+    return same;
+}
+
 static void test_cluster3_client_writes_and_failover() {
     std::puts("test_cluster3_client_writes_and_failover");
     ::alarm(40);
@@ -2162,9 +2175,13 @@ static void test_cluster3_client_writes_and_failover() {
     const auto del = c.node(leader).submit(command{"DEL", "k0", std::nullopt}, 3000ms);
     CHECK(del.outcome && del.outcome->result == "OK");
     CHECK(await_everywhere(c, "k4", "v4", 2000ms) >= 0 && await_everywhere(c, "k0", "NOT_FOUND", 2000ms) >= 0);
-    const std::string all = c.node(leader).stored_all();
-    for (node_id id = 1; id <= 3; ++id) { CHECK(c.node(id).stored_all() == all); }
-    CHECK(all.find("red") == std::string::npos);
+    // Identical stores: the same count, and the same value for every key
+    // written (which covers all of them: color, k1..k4). The follower's
+    // rejected color=red never applied anywhere.
+    const std::vector<std::string> written = {"color", "k0", "k1", "k2", "k3", "k4"};
+    CHECK(c.node(leader).stored_count() == 5);
+    CHECK(same_stores(c, {1, 2, 3}, leader, written));
+    for (node_id id = 1; id <= 3; ++id) { CHECK(c.node(id).stored("color") == "blue"); }
     std::this_thread::sleep_for(100ms);  // let the last commit index reach every log's state file
     for (node_id id = 1; id <= 3; ++id) { CHECK(read_file(c.log_path(id)) == read_file(c.log_path(leader))); }
 
@@ -2189,7 +2206,10 @@ static void test_cluster3_client_writes_and_failover() {
     c.restart(leader);
     CHECK(await_everywhere(c, "after", "failover", 3000ms) >= 0);
     CHECK(c.node(leader).stored("color") == "blue");
-    for (node_id id = 1; id <= 3; ++id) { CHECK(c.node(id).stored_all() == c.node(b->leader).stored_all()); }
+    std::vector<std::string> all_written = written;
+    all_written.push_back("after");
+    CHECK(c.node(b->leader).stored_count() == 6);
+    CHECK(same_stores(c, {1, 2, 3}, b->leader, all_written));
     CHECK(c.history.at_most_one_leader_per_term());
 }
 

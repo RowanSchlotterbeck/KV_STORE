@@ -63,11 +63,12 @@ static void test_other_commands_unchanged() {
     std::puts("test_other_commands_unchanged");
     CHECK(input_parser(R"(GET "b")") == (args_t{"GET", "b"}));
     CHECK(input_parser(R"(DEL "b")") == (args_t{"DEL", "b"}));
-    CHECK(input_parser("LIST") == (args_t{"LIST"}));
     CHECK(process_line(R"(DEL "b")") == "OK");
     CHECK(process_line(R"(DEL "b")") == "NOT_FOUND");
     CHECK(process_line(R"(GET "missing")") == "NOT_FOUND");
-    CHECK(process_line("LIST") == "(empty)");
+    // LIST was removed: it is an unknown command like any other.
+    CHECK(process_line("LIST") == "ERR_UNKNOWN_CMD");
+    CHECK(process_line("list") == "ERR_UNKNOWN_CMD");
     CHECK(process_line("EXIT") == "EXIT");
 
     // Garbage / malformed input.

@@ -38,7 +38,7 @@ struct client_request
 };
 client_request parse_request(const std::string& line);
 
-// GET / LIST against the state machine, as process_line() answers them.
+// GET against the state machine, as process_line() answers it.
 std::string execute_read(const command& cmd);
 
 // Applies a committed command to the state machine and returns its result

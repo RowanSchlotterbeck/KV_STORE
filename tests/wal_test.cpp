@@ -95,7 +95,7 @@ static void test_append_reopen_replay() {
     CHECK(matches(fresh, {{"a", "overwritten"}, {"b", "2"}, {"empty", ""}, {"gone", std::nullopt}}));
     // Empty value is present, not absent.
     CHECK(fresh.get(command{"GET", "empty", std::nullopt}) == "");
-    CHECK(fresh.list().find("empty => \n") != std::string::npos);
+    CHECK(fresh.size() == 3);  // a, b, empty: "gone" was deleted
 }
 
 static void test_index_resumes_after_reopen() {

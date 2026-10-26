@@ -81,7 +81,7 @@ answered:
 - **Writes** (`PUT`, `DEL`) go to the leader, which appends them to its log
   in its current term, replicates them, and replies (`OK`, `NOT_FOUND`, ...)
   only once the entry is committed on a majority and applied.
-- **Reads** (`GET`, `LIST`) are served by the leader from its applied state,
+- **Reads** (`GET`) are served by the leader from its applied state,
   once it has applied everything committed before its term. They are not
   linearizable (no ReadIndex): a leader that has just been deposed without
   knowing it can serve a stale read.
@@ -169,7 +169,6 @@ input and normalized to uppercase.
 | `PUT "<key>" "<value>"`   | `OK`                            |
 | `GET "<key>"`              | the value, or `NOT_FOUND`       |
 | `DEL "<key>"`              | `OK`, or `NOT_FOUND`            |
-| `LIST`                    | `key => value` per line, or `(empty)` |
 | `EXIT`                    | `EXIT` (client disconnects)     |
 
 Malformed input (wrong quoting, oversized key/value, unknown command)

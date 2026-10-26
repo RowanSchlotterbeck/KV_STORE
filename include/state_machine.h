@@ -21,12 +21,8 @@ public:
         return (it != store.end()) ? it->second : "NOT_FOUND";
     }
 
-    std::string list() const {
-        std::string out;
-        for (const auto& [k, v] : store)
-            out += k + " => " + v + "\n";
-        return out.empty() ? "(empty)" : out;
-    }
+    // Number of keys stored (for tests comparing whole stores).
+    std::size_t size() const { return store.size(); }
 
 private:
     std::unordered_map<std::string, std::string> store;

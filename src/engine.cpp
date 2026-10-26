@@ -70,15 +70,11 @@ client_request parse_request(const std::string& line) {
         return {kind::write, {}, command{op, args[1], std::nullopt}};
     }
 
-    if (op == "LIST") {
-        return {kind::read, {}, command{op, {}, std::nullopt}};
-    }
-
     return {kind::reply, "ERR_UNKNOWN_CMD", {}};
 }
 
 std::string execute_read(const command& cmd) {
-    return cmd.operation == "LIST" ? state_machine.list() : state_machine.get(cmd);
+    return state_machine.get(cmd);
 }
 
 std::string apply_command(const command& cmd) {
