@@ -251,3 +251,12 @@ target_compile_definitions(kv_status_server_test PRIVATE
 add_dependencies(kv_status_server_test kv_server)
 add_test(NAME status_server COMMAND kv_status_server_test $<TARGET_FILE:kv_server>)
 set_tests_properties(status_server PROPERTIES TIMEOUT 120)
+
+# Runs kv_client against fake servers, so it needs the client built first.
+add_executable(kv_client_test
+        tests/client_test.cpp
+)
+
+add_dependencies(kv_client_test kv_client)
+add_test(NAME client COMMAND kv_client_test $<TARGET_FILE:kv_client>)
+set_tests_properties(client PROPERTIES TIMEOUT 120)
