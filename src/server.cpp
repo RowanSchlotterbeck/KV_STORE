@@ -339,7 +339,13 @@ int main(int argc, char** argv) {
 
     std::optional<ClusterFrontEnd> front;
     if (cluster) { front.emplace(ClusterFrontEnd{*raft, *cluster}); }
-    Server server(io, client_port, front ? &*front : nullptr);
+    std::optional<Server> server;
+    try {
+        server.emplace(io, client_port, front ? &*front : nullptr);
+    } catch (const std::system_error& e) {
+        std::cerr << "Failed to listen for clients on port " << client_port << ": " << e.what() << "\n";
+        return 1;
+    }
     std::cout << "KV server listening on port " << client_port << "\n";
     io.run();
 }

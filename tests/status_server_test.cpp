@@ -924,6 +924,28 @@ static void test_port_validation() {
     }
 }
 
+// A client port something else already holds: a clean exit 1 naming the
+// port, like the peer and status listeners, not an uncaught-exception abort.
+static void test_client_port_in_use() {
+    std::puts("test_client_port_in_use");
+    const fs::path dir = g_tmp_root / "client_port";
+    fs::create_directories(dir);
+    // Held on the wildcard address, which is what the client listener binds.
+    asio::io_context io;
+    tcp::acceptor taken(io, tcp::endpoint(tcp::v4(), 0));
+    const std::uint16_t busy = taken.local_endpoint().port();
+    const std::uint16_t peer = free_port();
+    const fs::path config = dir / "cluster.conf";
+    std::ofstream(config) << "1 127.0.0.1 " << peer << " " << busy << "\n";
+
+    Node n(dir / "node", config, {1, peer, busy, 0});
+    const auto code = n.wait_exit(10000ms);
+    CHECK(code && *code == 1);
+    const std::string want = "Failed to listen for clients on port " + std::to_string(busy);
+    CHECK(n.err().find(want) != std::string::npos);
+    std::printf("  client port in use -> exit %d: %s", code ? *code : -1, n.err().c_str());
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::fprintf(stderr, "usage: %s <path to kv_server>\n", argv[0]);
@@ -950,6 +972,7 @@ int main(int argc, char** argv) {
     test_polling_does_not_perturb_raft();
     test_opt_out();
     test_port_validation();
+    test_client_port_in_use();
 
     std::error_code ec;
     fs::remove_all(g_tmp_root, ec);
