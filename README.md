@@ -1,319 +1,119 @@
-# KV_STORE
+# Distributed Key-Value Store
 
-A small in-memory key-value store with a text-based TCP protocol, built on
-[Asio](https://think-async.com/Asio/) (standalone, non-Boost) for
-single-threaded async networking.
+A key-value store is a simple kind of database: you give it a key (like "Rowan Schlotterbeck") and a value (like "Student"), and it remembers that pairing so you can look it up later. This project is a key-value store that runs on several computers at once instead of just one. If one of those computers crashes, the others keep working and no data is lost. It does this using a well-known method for keeping multiple machines in agreement, called the Raft Consensus Algorithm.
 
-## Layout
+It is written from scratch in C++. Below is a a web page where you can watch the machines elect a leader and recover from a crash in real time.
 
-```
-include/        Public headers (engine, parser, kv_store, wal)
-network/        Server/client headers
-src/            Implementation + entry points (kv_server, kv_client)
-bench/          Benchmark programs
-```
+https://raft-visual.netlify.app 
 
-- `kv_store.{h,cpp}` — `execute()`: applies a parsed command to the
-  in-memory `unordered_map<string, string>`.
-- `parser.{h,cpp}` — `input_parser()`: tokenizes a line and validates
-  command shape (see Protocol below).
-- `engine.{h,cpp}` — `process_line()`: parses + executes a single line
-  against the process-wide store; this is what the server calls per request.
-- `wal.{h,cpp}` — `PersistentLog`: append-only, fsync-per-write command
-  log. Writes are logged before they are applied; the server replays it on
-  startup (`kv_server [log_path]`, default `data/kvstore.log`). Each entry
-  is framed as `[u32 length][u32 CRC32C][payload]` (format in `wal.h`); a
-  torn or zero-filled tail is truncated on replay, while a checksum mismatch
-  stops startup.
-- `crc32c.{h,cpp}` — CRC32C (Castagnoli), hardware-accelerated when the
-  target supports it, with a table-driven fallback.
-- `rpc_frame.{h,cpp}` — framing for node-to-node Raft RPCs:
-  `[u32 length][u8 type tag][protobuf payload]` (format in `rpc_frame.h`).
-- `peer_config.{h,cpp}` — static cluster config (`<node_id> <host>
-  <peer_port>` per line; see `config/cluster.example.conf`).
-- `network/peer_transport.h`, `src/peer_transport.cpp` — peer RPC
-  listener (`PeerServer`) and connect-per-RPC client
-  (`ConnectPerRpcClient`), both on the server's single `io_context`.
-- `raft_node.{h,cpp}` — `RaftNode`: Raft leader election and heartbeats
-  (Figure 2) on the same `io_context`, driven by two Asio timers. Election
-  only: no log replication or commit index yet.
-- `network/status_server.h`, `src/status_server.cpp` — `StatusServer`: a
-  minimal read-only HTTP listener for the `/status` endpoint (below), on the
-  same `io_context`.
-- `src/server.cpp` / `src/client.cpp` — Asio TCP server and a simple
-  interactive client, both built on `kv_core`.
 
-## Building
 
-Requires CMake 3.16+, a C++20 compiler, and standalone Asio headers.
+## What it does
+
+- Several machines (called nodes) work together as one store.
+- The nodes automatically pick one of themselves to be in charge (the leader). If the leader stops working, the others notice and pick a new one on their own, usually in about a quarter of a second.
+- When you save something, it is not confirmed until a majority of the machines have safely recorded it. This is what makes sure your data is not lost if one machine dies right after.
+- Every machine keeps its own copy of all the data, so the group stays in sync.
+- If a machine crashes and restarts, it automatically catches back up with the others.
+- Data is written safely to disk, so even pulling the power plug does not lose anything that was confirmed.
+
+## Try it in 60 seconds
+
+You will need CMake, a C++20 compiler, and the Asio library.
+
+Build it:
 
 ```
 cmake -S . -B build
 cmake --build build -j
 ```
 
-By default the build looks for Asio at `/opt/homebrew/opt/asio/include`
-(Homebrew on Apple Silicon). If your Asio headers live elsewhere, install
-via Homebrew (`brew install asio`) or edit the `target_include_directories`
-paths in `CMakeLists.txt`.
-
-This produces:
-
-- `kv_server` — the TCP server, listening on port `5555`.
-- `kv_client` — an interactive line-based client.
-- `kv_bench_engine` — in-process engine benchmark (no networking).
-- `kv_bench_network` — network round-trip benchmark against a running
-  `kv_server`.
-
-## Running
+Start three machines, each in its own terminal window:
 
 ```
-./build/kv_server &
-./build/kv_client
+./build/kv_server data/n1.log --cluster config/cluster.conf --node-id 1 --client-port 5551 --status-port 8081
+./build/kv_server data/n2.log --cluster config/cluster.conf --node-id 2 --client-port 5552 --status-port 8082
+./build/kv_server data/n3.log --cluster config/cluster.conf --node-id 3 --client-port 5553 --status-port 8083
 ```
 
-With `--cluster <file> --node-id <id>` the server runs as one node of a Raft
-cluster: it listens for peer RPCs on its `peer_port` from the config, takes
-part in leader election, and replicates the leader's log, logging what it
-does to stderr. Client writes are committed through Raft before they are
-answered:
+Within about a second, one of them becomes the leader. Now the interesting part: press Ctrl-C on the leader to "kill" it. Watch the other two. In a fraction of a second, one of them takes over as the new leader, and the store keeps working. That recovery, happening on its own with no human involved, is the whole point of the project.
 
-- **Writes** (`PUT`, `DEL`) go to the leader, which appends them to its log
-  in its current term, replicates them, and replies (`OK`, `NOT_FOUND`, ...)
-  only once the entry is committed on a majority and applied.
-- **Reads** (`GET`) are served by the leader from its applied state,
-  once it has applied everything committed before its term. They are not
-  linearizable (no ReadIndex): a leader that has just been deposed without
-  knowing it can serve a stale read.
-- A **non-leader** answers either kind with `REDIRECT <leader_id> <host>:<client_port>`
-  (just `REDIRECT <leader_id>` if the config doesn't list the leader's client
-  port), or `ERR_NO_LEADER` if it doesn't know one.
-- A request in progress when the leader steps down gets `ERR_LEADERSHIP_LOST`;
-  one that waits more than 5s gets `ERR_TIMEOUT`. In both cases a write may
-  or may not have committed: retry it (`PUT` is idempotent; a retried `DEL`
-  may answer `NOT_FOUND`).
+If you would rather not install anything, the **[visualizer link]** lets you watch all of this in your browser.
 
-Each node keeps `currentTerm`, `votedFor` and its commit index in
-`<log_path>.raftstate`, fsynced before it acts on them, so a restarted node
-keeps its vote and applies only entries known committed; a corrupt state
-file stops startup. Client ports come from the config's optional fourth
-column, or `--client-port <port>` (default 5555; it must agree with the
-config if both are given). Without `--cluster` it runs single-node, exactly
-as before.
+## How it is put together
 
-```
-# three terminals
-./build/kv_server data/n1.log --cluster config/cluster.example.conf --node-id 1
-./build/kv_server data/n2.log --cluster config/cluster.example.conf --node-id 2
-./build/kv_server data/n3.log --cluster config/cluster.example.conf --node-id 3
-```
+The store is a group of identical machines. At any moment one of them is the leader and the rest are followers. All saves go through the leader, which then passes them along to the followers. Reads are answered by the leader too.
 
-### Status endpoint
+Each machine keeps three things:
 
-`--status-port <port>` (cluster mode only; off by default) starts a read-only
-HTTP listener on `127.0.0.1:<port>` for dashboards. It must differ from this
-node's client port and from every peer/client port the config lists for the
-same host; a clash, or a port already in use, stops startup. Without the
-flag nothing extra listens and the node behaves exactly as before.
+- A log, which is an ordered list of every change ever made. Think of it as a journal that is only ever added to.
+- The actual data, which is just the result of replaying that journal from the top.
+- A record of who it has voted for and what round of elections it is on, so it behaves correctly even after a restart.
 
-```
-./build/kv_server data/n1.log --cluster config/cluster.example.conf --node-id 1 --status-port 8081
-curl http://127.0.0.1:8081/status
-```
+Each machine listens on three separate channels: one for talking to clients (the people saving and reading data), one for talking to the other machines, and one read-only channel that simply reports the machine's current status, which is what the visualizer reads.
 
-- `GET /status` → `200 application/json`
-- `GET /healthz` → `200 ok`
-- any other method → `405`; unknown path → `404`; malformed request → `400`
+Everything on a single machine runs on one thread. This was a deliberate choice. It means the machine does one thing at a time in a predictable order, which removes a whole category of bugs that come from several things happening at once.
 
-The `/status` body is one JSON object:
+## How the agreement works
 
-| Field | Type | Meaning |
-|-------|------|---------|
-| `node_id` | uint | this node |
-| `role` | string | `"follower"`, `"candidate"` or `"leader"` |
-| `current_term` | uint | current term |
-| `leader_id` | uint | leader known for this term, `0` if none |
-| `log_last_index` | uint | index of the last entry in this node's log |
-| `commit_index` | uint | highest index known committed |
-| `last_applied` | uint | highest index applied to the store |
-| `peers` | array | leader: `{"id", "nextIndex", "matchIndex"}` per follower; `[]` on other roles |
-| `seq` | uint | count of `/status` responses from this process (tells polls apart) |
-| `timestamp_ms` | uint | wall-clock Unix time of the response, in ms |
+**Picking a leader.** Each follower waits a short, random amount of time to hear from a leader. If it hears nothing, it assumes there is no leader and puts itself forward, asking the others to vote for it. Whoever gets votes from more than half the group becomes the leader. The randomness matters: it keeps the machines from all volunteering at the same instant and splitting the vote.
 
-```
-{"node_id":2,"role":"leader","current_term":1,"leader_id":2,"log_last_index":2,"commit_index":2,"last_applied":2,"peers":[{"id":1,"nextIndex":3,"matchIndex":2},{"id":3,"nextIndex":3,"matchIndex":2}],"seq":2,"timestamp_ms":1792615816600}
-```
+**Staying leader.** The leader sends a quick "still here" message to everyone several times a second. As long as the followers keep hearing it, they stay followers. If those messages stop, a new election begins.
 
-It is purely an observer. It runs on the node's single event loop, so each
-response is a consistent snapshot taken between Raft steps. It reads only
-in-memory state: no disk, no RPCs, no waiting. Each connection carries one
-request, and a client that doesn't finish within 2s is dropped. `/status`
-sends `Access-Control-Allow-Origin: *` so a browser dashboard on another
-origin can poll it. That is intended for local demos: the data is read-only,
-but there is no authentication.
+**Saving data.** When you save something, the leader writes it to its own journal, then sends it to the followers. Once more than half the machines have safely recorded it, the leader marks it as official, updates its own data, tells the others to do the same, and only then tells you it worked. Because a majority already has it, the save survives even if the leader dies the very next moment.
 
-Or talk to it directly with `nc`:
+**Catching up after a crash.** A machine that falls behind, whether it crashed or just missed some messages, is brought back up to date by the leader automatically. The leader figures out where the two of them last agreed and sends over everything the follower is missing.
 
-```
-nc 127.0.0.1 5555
-```
+**Surviving restarts.** Before a machine confirms anything important, it writes that fact to disk first. So if it crashes and comes back, it remembers what it had already promised and does not contradict itself.
 
-## Protocol
+## Decisions worth explaining
 
-One command per line, terminated by `\n`. Keys and values must be
-double-quoted; the command name is not. Commands are case-insensitive on
-input and normalized to uppercase.
+**How data is packaged for saving and sending.** I used a widely used format called Protocol Buffers rather than inventing my own. The main reason is that it would let someone write one of these machines in a different programming language later, and it would still understand the others. It is also a standard tool that real distributed systems use.
 
-| Command                  | Reply                          |
-|---------------------------|---------------------------------|
-| `PUT "<key>" "<value>"`   | `OK`                            |
-| `GET "<key>"`              | the value, or `NOT_FOUND`       |
-| `DEL "<key>"`              | `OK`, or `NOT_FOUND`            |
-| `EXIT`                    | `EXIT` (client disconnects)     |
+**How saved data is checked for damage.** Each entry in the journal carries a small checksum, which is a number that lets a machine notice if the data got corrupted on disk. I used a lightweight kind called CRC32C rather than a heavy cryptographic one, such as SHA-256. The heavy kind is designed to stop a malicious person from secretly altering data, which is not the problem here. The problem here is ordinary disk corruption, and the lightweight check catches that perfectly while being much faster.
 
-Malformed input (wrong quoting, oversized key/value, unknown command)
-returns `INPUT_ERROR` or `ERR_UNKNOWN_CMD`.
+**One thing at a time.** As mentioned above, each machine runs on a single thread. This trades away some raw speed in exchange for being far easier to reason about and get correct.
 
-Example session:
+**Safety over speed when saving.** Every save waits for the data to be truly written to the physical disk before confirming. This makes each save slower, but it is the only way to honestly promise that confirmed data survives a power loss.
 
-```
-$ nc 127.0.0.1 5555
-PUT "foo" "bar"
-OK
-GET "foo"
-bar
-DEL "foo"
-OK
-GET "foo"
-NOT_FOUND
-```
+## How it was tested
+
+Correctness was not assumed, it was thoroughly checked. The tests include:
+
+- Deliberately crashing machines at the worst possible moments and confirming they recover correctly.
+- Cutting the journal file off at every possible point to confirm a half-written entry is handled safely rather than corrupting everything.
+- Reproducing two tricky scenarios (Figure 7 & 8) straight from the original Raft research paper to confirm the system behaves the way the paper says it should.
+- Running the code under tools that detect memory mistakes, with no problems found.
+
+The fault-tolerance results below come from a separate benchmark that drives a real group of machines, kills and freezes them at random while saving data, and then checks that nothing was lost.
 
 ## Benchmarks
 
-Two benchmark binaries live under `bench/`:
+All numbers are from a MacBook Pro (Apple Silicon), with the default settings: an election timeout between 150 and 300 milliseconds and a heartbeat every 50 milliseconds.
 
-- **`kv_bench_engine`** calls `process_line()` (and the lower-level
-  `execute()`) directly in-process, so it isolates parser + map
-  performance from any networking cost.
+**How fast it recovers from a leader failure.** The leader was killed while the store was handling a steady stream of saves, and this was repeated 50 times on a 3-machine group. The group picked a new leader and resumed saving in a median of about 250 milliseconds, with 90 percent of recoveries finishing under about 305 milliseconds. A few took longer (up to about 570 milliseconds). Those were the cases where the first vote was split and a second round was needed, which is normal. Recovery time is set mainly by how long a machine waits before assuming the leader is gone, which here is 150 to 300 milliseconds, so these numbers line up with what the design predicts. A 5-machine group behaved similarly, with a median around 280 milliseconds and a tighter worst case.
 
-  ```
-  ./build/kv_bench_engine [num_ops]   # default 200000
-  ```
+**Whether it loses data under stress.** The store was put through 60 seconds of deliberate chaos: machines were killed and restarted, and frozen and thawed, at random, while saves ran the whole time. Afterwards everything was brought back and the group was allowed to settle, then every save that had been confirmed to the client was checked.
 
-- **`kv_bench_network`** drives a real TCP connection against a running
-  `kv_server`, using the same synchronous request/response pattern as
-  `kv_client`. This captures real round-trip cost (syscalls, Asio,
-  Nagle/TCP effects), not just engine throughput.
+- 3 machines: 1,284 confirmed saves, 0 lost, no disagreement between machines, across 21 injected failures.
+- 5 machines: 872 confirmed saves, 0 lost, no disagreement between machines, across 38 injected failures.
 
-  ```
-  ./build/kv_server &
-  ./build/kv_bench_network [host] [port] [num_ops]   # default 127.0.0.1 5555 20000
-  ```
+Saves that were never confirmed (because a machine died mid-request) are reported separately and not counted either way, since the client genuinely cannot know whether those landed.
 
-Both report throughput (ops/sec) and p50/p99 latency per command type
-(`PUT`, `GET` hit, `GET` miss). Sample output on Apple Silicon (M-series):
+The checker itself was tested by planting known problems: a save that was never really made, a secretly deleted key, and a single corrupted byte in one machine's records. It caught all of them.
 
-```
-$ ./build/kv_bench_engine 100000
-process_line PUT                 100000 ops      21.83 ms       4580775 ops/sec  p50=0.21us  p99=0.38us
-process_line GET (hit)           100000 ops      10.12 ms       9878079 ops/sec  p50=0.08us  p99=0.12us
-execute PUT                      100000 ops       1.97 ms      50641706 ops/sec  p50=0.00us  p99=0.04us
-execute GET (hit)                100000 ops       1.89 ms      53017378 ops/sec  p50=0.00us  p99=0.04us
+## What it does not do yet (Future Work)
 
-$ ./build/kv_bench_network 127.0.0.1 5555 5000
-PUT                          5000 ops     146.26 ms       34185 ops/sec  p50=26.2us  p99=58.5us
-GET (hit)                    5000 ops     132.48 ms       37740 ops/sec  p50=26.2us  p99=34.4us
-```
+Being clear about the edges:
 
-The gap between `process_line` and `execute` numbers shows parsing
-(quote scanning, uppercasing, length checks) accounts for a meaningful
-share of per-command engine cost. The much larger gap between in-process
-and network numbers shows the current single connection/synchronous
-round trip, not the engine, is the bottleneck for real client traffic.
+- The journal grows forever. There is no cleanup of old entries yet (a feature usually called snapshotting).
+- The group of machines is fixed when it starts. You cannot add or remove machines while it is running.
+- A machine that has fallen a long way behind catches up slowly, because it re-checks agreement one step at a time. In testing, a machine about 900 entries behind took around 30 to 50 seconds to catch up. There is a well-known fix for this (sending a hint about where to resume) that is not implemented yet.
+- Reads are always answered by the leader and are not optimized for the strictest possible consistency guarantees.
+- It is set up to run on one computer for demonstration. Running it across real separate machines would need configuration changes.
 
-### Fault tolerance (`bench/fault_tolerance.py`)
+## References
 
-A Python harness (standard library only) that runs a real cluster of
-`kv_server` processes in a temp dir, with a generated config and ports the
-OS hands out, and SIGKILLs every node it started when it exits.
-
-```
-python3 -I bench/fault_tolerance.py build/kv_server            # both parts, 3 nodes
-python3 -I bench/fault_tolerance.py build/kv_server --quick    # 5 trials, 15s of chaos
-python3 -I bench/fault_tolerance.py build/kv_server chaos --nodes 5 --chaos-seconds 120 --seed 42
-```
-
-It exits 0 on success, 1 if an invariant is violated (the message names the
-key and value involved), and 2 if the harness itself can't run (e.g. no
-leader emerges). `--help` lists every option.
-
-- **Failover time (Part A).** A writer sends PUTs with unique keys to the
-  leader; the harness SIGKILLs the leader, then measures the time until the
-  first write *sent after the kill* is acknowledged, and checks via `/status`
-  that a new leader in a higher term took over. The killed node is restarted
-  and the cluster settles before the next trial. This is bounded below by the
-  election timeout (150–300ms, randomized): followers only notice the leader
-  is gone once their timer fires. It also includes the election, the new
-  leader's no-op and the write's own commit. The tail is a second election:
-  in the 3-node run below, the 4 slowest trials (403–568ms) are exactly the 4
-  whose term advanced by 2 (the first election failed and timed out again).
-  Every trial won by the first election finished within 316ms.
-- **No lost writes under chaos (Part B).** Writers keep sending PUTs while a
-  chaos loop SIGKILLs and restarts nodes, and SIGSTOPs then SIGCONTs them, with
-  at most ⌊(N−1)/2⌋ faulty at a time so a majority can always make progress.
-  SIGSTOP stands in for an unreachable node: the kernel still accepts TCP
-  connections, but the process reads and answers nothing until SIGCONT. Once
-  per run, a majority is frozen for 8s with the leader left alone; no write
-  sent during that phase may be acknowledged.
-
-Each write ends in exactly one outcome, and only `OK` counts as
-acknowledged:
-
-| Reply | Outcome |
-|---|---|
-| `OK` | **acknowledged**: must be present, with its value, at the end |
-| `REDIRECT <id>` | not an outcome: resend to that node |
-| `ERR_NO_LEADER`, connection refused | not acknowledged (never proposed): retry the same write |
-| `ERR_LEADERSHIP_LOST`, `ERR_TIMEOUT`, connection dropped or no reply within 3s | **ambiguous**: may or may not have committed; counted, never asserted either way |
-
-Reads aren't linearizable, so nothing is read back until faults have stopped
-and every node agrees on the leader, term and a fully applied commit index.
-Then every acknowledged write is read back from the leader. Followers answer
-`GET` with `REDIRECT`, so to check for divergence the harness reads every
-node's log file instead: the committed entries `1..commit_index` must be
-identical on all nodes, and replaying them must produce every acknowledged
-value and no key the harness never wrote.
-
-Measured on this machine (macOS, Apple Silicon), default settings:
-
-```
-3 nodes, 50 trials
-  failover time (leader SIGKILL -> first acknowledged write):
-    min 187.5  p50 247.5  p90 303.3  p99 532.8  max 568.2 ms  (mean 264.2)
-  1122 acknowledged, 50 ambiguous, 0 lost; committed logs identical on all 3 nodes
-3 nodes, 60s of chaos
-  faults injected: 8 kill+restart, 12 freeze+thaw (SIGSTOP/SIGCONT), 1 majority-frozen phase
-  RESULT: 1284 acknowledged writes, 0 lost, 0 divergence across 21 injected faults
-5 nodes, 20 trials + 60s of chaos
-  failover: min 217.2  p50 277.3  p90 310.2  p99 324.5  max 327.0 ms
-  RESULT: 872 acknowledged writes, 0 lost, 0 divergence across 38 injected faults
-```
-
-After chaos stops, it can take 25–50s before every node agrees. A follower
-that fell far behind (e.g. restarted early in the run) finds the point where
-its log matches the leader's by stepping back one index per heartbeat, and
-each new leader starts that search over from the end of its own log. The
-harness waits up to `--converge-timeout` (180s) and prints the time taken.
-
-## Known limitations
-
-- Cluster mode has no log compaction or snapshots (the log grows forever
-  and a restart reads all of it), no membership changes, and no
-  linearizable reads. A follower far behind catches up one heartbeat per
-  missing index before entries flow, and every probe carries entries even
-  while it is being rejected.
-- Every write is fsynced individually (no batching), so
-  write throughput is bounded by disk sync latency.
-- No authentication, TLS, or multi-database support.
-- The server handles one line per read/write cycle per connection with
-  no pipelining.
+- The Raft paper: "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout. https://raft.github.io/raft.pdf
+- More about Raft: https://raft.github.io/
+- The companion visualizer, which lets you watch all of this happen in a browser: https://raft-visual.netlify.app 
